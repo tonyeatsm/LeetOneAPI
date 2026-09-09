@@ -1,0 +1,449 @@
+// ============================================================================
+// elementwise.sycl —— Intel oneAPI/SYCL 逐元素加法（elementwise add）教学示例
+//
+// 本文件实现 c[i] = a[i] + b[i]，数组长度为 N。
+// 所有 kernel 都把输入输出当作“一维数组”看待，二维 (S, K) 矩阵在启动端
+// 展平成 N = S * K。
+//
+// 对应 LeetCUDA/kernels/elementwise/elementwise.cu，包含 6 个计算版本：
+//   1. f32        : FP32 标量版（每 work-item 1 个元素）
+//   2. f32x4      : FP32 向量化版（每 work-item 4 个元素，16 字节访存）
+//   3. f16        : FP16 标量版（sycl::half，每 work-item 1 个元素）
+//   4. f16x2      : FP16 每 work-item 2 个元素（4 字节访存）
+//   5. f16x8      : FP16 每 work-item 8 个元素（4 次 4 字节访存）
+//   6. f16x8_pack : FP16 每 work-item 8 个元素（一次 16 字节/128 位访存）
+//
+// 学习重点（CUDA → SYCL 概念迁移）：
+// - CUDA <<<grid, block>>>  → SYCL nd_range<1>(global_range, local_range)
+// - CUDA blockIdx.x/threadIdx.x → SYCL 的 work-group / work-item 概念，
+//   kernel 里直接使用 item.get_global_id(0) 得到“全局编号”；
+// - 越界保护：if (idx < N)
+// - 向量化 / 更宽访存 / FP16 是 elementwise kernel 常见的带宽优化手段
+//
+// 本文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用函数，
+// 供 elementwise.py 编译与基准测试使用。运行环境要求 PyTorch XPU
+// （Intel GPU 后端，pip 安装源 https://download.pytorch.org/whl/xpu）。
+// ============================================================================
+
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <torch/types.h>
+
+// 常量：与 CUDA 版保持同一套启动策略
+// ELEMS_PER_GROUP：一个 work-group 固定处理的元素数（对应 CUDA 里一个 block
+//                  处理 256 个元素）
+// MAX_GROUP_ITEMS：一个 work-group 的 work-item 数上限（对应 CUDA block 上限 1024）
+#define ELEMS_PER_GROUP 256
+#define MAX_GROUP_ITEMS 1024
+
+// ----------------------------------------------------------------------------
+// 向量类型别名
+// CUDA 的 float4 / half2 在 SYCL 中对应 sycl::vec<T, N>：
+//   float4 -> sycl::vec<float, 4>（4 × 4B = 16 字节）
+//   half2  -> sycl::vec<sycl::half, 2>（2 × 2B = 4 字节）
+//   half8  -> sycl::vec<sycl::half, 8>（8 × 2B = 16 字节，一次 128 位访存）
+// ----------------------------------------------------------------------------
+using float4_vec = sycl::vec<float, 4>;
+using half2_vec = sycl::vec<sycl::half, 2>;
+using half8_vec = sycl::vec<sycl::half, 8>;
+
+// ----------------------------------------------------------------------------
+// 访存“重解释（reinterpret）”宏
+//
+// GPU 一次访存指令能搬移的位宽有限。把一段连续内存 reinterpret 成更宽的
+// SYCL 向量类型，可以让编译器生成更宽的 load/store 指令。
+//
+// 用法示例：
+//   LOAD_FLOAT4(a + idx)  从 a[idx..idx+3] 一次读 16 字节成 vec<float,4>
+//   STORE_FLOAT4(c + idx, value)  把 16 字节的 vec<float,4> 一次写回
+//
+// 要求 ptr 对应地址按向量大小对齐；torch 分配的 XPU 张量内存地址满足要求，
+// 且 idx 取 4/2/8 的倍数，因此本文件中的用法保持对齐。
+// ----------------------------------------------------------------------------
+#define LOAD_FLOAT4(ptr) (*reinterpret_cast<const float4_vec *>(ptr))
+#define STORE_FLOAT4(ptr, value) (*reinterpret_cast<float4_vec *>(ptr) = (value))
+
+#define LOAD_HALF2(ptr) (*reinterpret_cast<const half2_vec *>(ptr))
+#define STORE_HALF2(ptr, value) (*reinterpret_cast<half2_vec *>(ptr) = (value))
+
+#define LOAD_HALF8(ptr) (*reinterpret_cast<const half8_vec *>(ptr))
+#define STORE_HALF8(ptr, value) (*reinterpret_cast<half8_vec *>(ptr) = (value))
+
+// ============================================================================
+// Kernel 1：FP32 标量版（最朴素写法，作为正确性基准）
+// ============================================================================
+//
+// ---- 调用链：谁触发了这个 kernel？ ----
+// elementwise.py
+//   └─ lib.elementwise_add_f32(a, b, c)            # Python 调用（pybind11）
+//       └─ elementwise_add_f32(...)                # C++ host 包装函数（宏生成，
+//                                                  #  运行在 CPU 上）
+//           └─ submit_add_f32(queue, ...)          # 本函数
+//               └─ queue.submit(parallel_for)      # SYCL 提交（对应 CUDA 启动语法）
+//                   └─ Intel GPU 硬件并行执行 kernel lambda
+//
+// 关键点：
+// - CUDA 用 <<<grid, block>>> 启动 __global__ 函数；SYCL 在 host 端用
+//   queue.submit + parallel_for 提交 kernel lambda；
+// - CUDA kernel 靠 blockIdx/threadIdx 算全局编号；SYCL 靠 nd_item
+//   （这里叫 item）的 get_global_id(0)；
+// - 启动后 GPU 的每个 work-item 都会执行一遍本函数体。
+//
+// nd_range 知识点速查：
+// 1. 一次 parallel_for(nd_range<1>(global, local)) 提交“全部 work-item”；
+//    global 是所有 work-item 数（相当于 CUDA grid * block）；
+//    local 是每个 work-group 的 work-item 数（相当于 CUDA block）；
+// 2. kernel 内可直接从 nd_item 查询：
+//    item.get_global_id(0)   = CUDA 全局线程编号 idx；
+//    item.get_group(0)       = CUDA blockIdx.x（当前是第几个 work-group）；
+//    item.get_local_id(0)    = CUDA threadIdx.x；
+//    item.get_local_range(0) = CUDA blockDim.x；
+// 3. 例：parallel_for(nd_range<1>(1024, 256))、N = 1000：
+//    - 共 1024 个 work-item，每 256 个一组，共 4 组；
+//    - group 0/1/2/3 分别负责 0~255、256~511、512~767、768~1023；
+//    - 下标 1000~1023 共 24 个 work-item 被 if (idx < N) 拦截，不参与计算；
+// 4. 同一个 kernel lambda 可以多次 submit，每次产生一次独立并行执行。
+// ----------------------------------------------------------------------------
+static void submit_add_f32(sycl::queue &queue, const float *a, const float *b,
+                           float *c, int N, size_t global_range,
+                           size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    // nd_range 分两层：global（总 work-item 数）与 local（每个 work-group 大小）
+    h.parallel_for<class ElementwiseAddF32Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        // [=]：kernel lambda 只能按值捕获设备可访问的指针/标量
+        [=](sycl::nd_item<1> item) {
+          // 全局 work-item 编号：get_global_id(0) 相当于 CUDA 的
+          // blockIdx.x * blockDim.x + threadIdx.x
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 越界保护：N 不一定是启动 work-item 总数的整数倍，多余的不参与计算
+          if (idx < N) {
+            c[idx] = a[idx] + b[idx];
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 2：FP32 向量化版（vec<float,4> = 4 个 float = 16 字节）
+// ============================================================================
+// 每个 work-item 连续处理 4 个元素，一次 16 字节的向量 load/store
+// 代替 4 次 4 字节访存，从而减少访存指令条数。
+//
+// host 端对应启动：local = 256 / 4 = 64 个 work-item，每个 work-group
+// 仍处理 256 个元素。
+static void submit_add_f32x4(sycl::queue &queue, const float *a,
+                             const float *b, float *c, int N,
+                             size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class ElementwiseAddF32x4Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
+          int idx = 4 * static_cast<int>(item.get_global_id(0));
+          // 主体：从 idx 开始连续 4 个元素都有效时才走向量化分支
+          if ((idx + 3) < N) {
+            // 把 a[idx..idx+3] 的 16 字节 reinterpret 成 vec<float,4>，一次读入
+            float4_vec reg_a = LOAD_FLOAT4(a + idx);
+            float4_vec reg_b = LOAD_FLOAT4(b + idx);
+            float4_vec reg_c;
+            // vec<float,4> 有 4 个分量，逐个相加
+            for (int i = 0; i < 4; ++i) {
+              reg_c[i] = reg_a[i] + reg_b[i];
+            }
+            // 一次 16 字节写回 c[idx..idx+3]
+            STORE_FLOAT4(c + idx, reg_c);
+          } else if (idx < N) {
+            // 尾巴（tail）：数组末尾不足 4 个元素时退回逐元素计算，
+            // 保证任意 N 都正确且不越界。
+            for (int i = 0; (idx + i) < N; ++i) {
+              c[idx + i] = a[idx + i] + b[idx + i];
+            }
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 3：FP16 标量版
+// ============================================================================
+// sycl::half 是 IEEE 754 半精度浮点，只占 2 字节（float 的一半）。
+// 相同显存带宽下，FP16 理论上能搬运两倍元素，代价是精度更低
+// （half 约 3~4 位十进制有效数字，保守按约 3 位）。
+//
+// 注意：sycl::half 是浮点类型，支持 a[idx] + b[idx] 运算符写法；
+// 编译出的设备代码会使用硬件/内建 FP16 加法。
+static void submit_add_f16(sycl::queue &queue, const sycl::half *a,
+                           const sycl::half *b, sycl::half *c, int N,
+                           size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class ElementwiseAddF16Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          int idx = static_cast<int>(item.get_global_id(0));
+          if (idx < N) {
+            c[idx] = a[idx] + b[idx];
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 4：FP16 每 work-item 2 个元素（vec<half,2> = 2 个 half = 4 字节）
+// ============================================================================
+// vec<half,2> 是 2 元素 half 向量，一次 load/store 4 字节，
+// 每 work-item 一次处理 2 个连续元素。
+static void submit_add_f16x2(sycl::queue &queue, const sycl::half *a,
+                             const sycl::half *b, sycl::half *c, int N,
+                             size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class ElementwiseAddF16x2Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 2 个连续 half
+          int idx = 2 * static_cast<int>(item.get_global_id(0));
+          // 2 个元素都有效时才走向量化分支
+          if ((idx + 1) < N) {
+            // 从 a[idx..idx+1] 读 4 字节为一个 vec<half,2>
+            half2_vec reg_a = LOAD_HALF2(a + idx);
+            half2_vec reg_b = LOAD_HALF2(b + idx);
+            half2_vec reg_c;
+            // vec 有两个分量，分别做 half 加法
+            reg_c[0] = reg_a[0] + reg_b[0];
+            reg_c[1] = reg_a[1] + reg_b[1];
+            STORE_HALF2(c + idx, reg_c);
+          } else if (idx < N) {
+            // 尾部：不足 2 个元素时逐元素补算
+            c[idx] = a[idx] + b[idx];
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 5：FP16 每 work-item 8 个元素（用 4 次 vec<half,2> 操作完成）
+// ============================================================================
+// 每个 work-item 负责 8 个连续 half，把它们拆成 4 个 vec<half,2>
+// （reg_*_0..3）处理。相比 f16x2，每个 work-item 做更多工作，
+// 能摊薄索引计算等固定开销。
+static void submit_add_f16x8(sycl::queue &queue, const sycl::half *a,
+                             const sycl::half *b, sycl::half *c, int N,
+                             size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class ElementwiseAddF16x8Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          // 8 个元素都有效才走向量化主体
+          if ((idx + 7) < N) {
+            // 一次读入 a 侧 4 个 vec<half,2>：覆盖 a[idx .. idx+7]
+            half2_vec reg_a_0 = LOAD_HALF2(a + idx + 0);
+            half2_vec reg_a_1 = LOAD_HALF2(a + idx + 2);
+            half2_vec reg_a_2 = LOAD_HALF2(a + idx + 4);
+            half2_vec reg_a_3 = LOAD_HALF2(a + idx + 6);
+            // 一次读入 b 侧 4 个 vec<half,2>：覆盖 b[idx .. idx+7]
+            half2_vec reg_b_0 = LOAD_HALF2(b + idx + 0);
+            half2_vec reg_b_1 = LOAD_HALF2(b + idx + 2);
+            half2_vec reg_b_2 = LOAD_HALF2(b + idx + 4);
+            half2_vec reg_b_3 = LOAD_HALF2(b + idx + 6);
+            // 结果也用 4 个 vec<half,2> 保存
+            half2_vec reg_c_0, reg_c_1, reg_c_2, reg_c_3;
+            // 每个 vec 的两个分量分别相加
+            reg_c_0[0] = reg_a_0[0] + reg_b_0[0];
+            reg_c_0[1] = reg_a_0[1] + reg_b_0[1];
+            reg_c_1[0] = reg_a_1[0] + reg_b_1[0];
+            reg_c_1[1] = reg_a_1[1] + reg_b_1[1];
+            reg_c_2[0] = reg_a_2[0] + reg_b_2[0];
+            reg_c_2[1] = reg_a_2[1] + reg_b_2[1];
+            reg_c_3[0] = reg_a_3[0] + reg_b_3[0];
+            reg_c_3[1] = reg_a_3[1] + reg_b_3[1];
+            // 结果写回 c[idx .. idx+7]
+            STORE_HALF2(c + idx + 0, reg_c_0);
+            STORE_HALF2(c + idx + 2, reg_c_1);
+            STORE_HALF2(c + idx + 4, reg_c_2);
+            STORE_HALF2(c + idx + 6, reg_c_3);
+          } else if (idx < N) {
+            // 尾部：不足 8 个元素时退回逐元素计算
+            for (int i = 0; (idx + i) < N; ++i) {
+              c[idx + i] = a[idx + i] + b[idx + i];
+            }
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 6：FP16 每 work-item 8 个元素（128 位打包版）
+// ============================================================================
+// 8 个 half 恰好是 16 字节 = 128 位。CUDA 版用 float4 做整体 reinterpret；
+// SYCL 版直接使用 vec<half, 8>，把 a[idx..idx+7] 看作一个 16 字节向量，
+// 一次 load/store 128 位，比 Kernel 5 的多条 4 字节访存指令更少。
+static void submit_add_f16x8_pack(sycl::queue &queue, const sycl::half *a,
+                                  const sycl::half *b, sycl::half *c, int N,
+                                  size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class ElementwiseAddF16x8PackKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          if ((idx + 7) < N) {
+            // 把 a[idx..idx+7] 的 16 字节整体 reinterpret 成 vec<half,8>，
+            // 用一条访存指令读入 128 位
+            half8_vec pack_a = LOAD_HALF8(a + idx);
+            half8_vec pack_b = LOAD_HALF8(b + idx);
+            half8_vec pack_c;
+
+            // 循环展开：i 每次 +2，相当于遍历 4 组（每组 2 个 half）
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+              pack_c[i] = pack_a[i] + pack_b[i];
+              pack_c[i + 1] = pack_a[i + 1] + pack_b[i + 1];
+            }
+            // 结果 pack_c[0..7] 共 128 位，一条 store 指令整体写回 c[idx..idx+7]
+            STORE_HALF8(c + idx, pack_c);
+          } else if (idx < N) {
+            // 尾部：不足 8 个元素时退回逐元素计算
+            for (int i = 0; (idx + i) < N; ++i) {
+              c[idx + i] = a[idx + i] + b[idx + i];
+            }
+          }
+        });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
+// #str 会把参数按字面内容生成字符串，例如 STRINGFY(add) 得到 "add"。
+// ----------------------------------------------------------------------------
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+// ----------------------------------------------------------------------------
+// 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype，
+// 否则打印张量信息并抛出运行时异常，避免把错误类型交给 kernel。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
+  if (((T).options().dtype() != (th_type))) {                                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
+    throw std::runtime_error("values must be " #th_type);                      \
+  }
+
+// ----------------------------------------------------------------------------
+// host 启动函数生成宏
+//
+// 宏参数：
+//   packed_type : 命名后缀，如 f32 / f32x4 / f16x8_pack
+//   th_type     : 对应的 torch dtype（torch::kFloat32 / torch::kHalf）
+//   element_type: kernel 中的 C++ 数据类型（float / sycl::half）
+//   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度）
+//
+// 展开后生成形如 elementwise_add_f32(torch::Tensor a, b, c) 的函数：
+//   1. 校验三个张量的 dtype 与 XPU 设备；
+//   2. 根据张量形状计算 nd_range 的 global/local；
+//   3. 用 data_ptr() 拿裸指针并从当前 XPU stream 取 sycl::queue 提交 kernel。
+//
+// 启动策略（与 CUDA 版一致）：
+// - 非二维张量：展平成 N，每个 work-group 固定处理 256 个元素，
+//   所以 local = 256 / n_elements，global = ceil(N / 256) * local；
+// - 二维 (S, K)：每行需要的 work-item 数不超过 1024 且能被向量宽度整除时，
+//   采用“一行一个 work-group”（local = K / n_elements，global = S * local）；
+//   否则回退到上面的展平策略。
+// ----------------------------------------------------------------------------
+#define TORCH_BINDING_ELEM_ADD(packed_type, th_type, element_type, n_elements) \
+  void elementwise_add_##packed_type(torch::Tensor a, torch::Tensor b,         \
+                                     torch::Tensor c) {                        \
+    CHECK_TORCH_TENSOR_DTYPE(a, (th_type))                                     \
+    CHECK_TORCH_TENSOR_DTYPE(b, (th_type))                                     \
+    CHECK_TORCH_TENSOR_DTYPE(c, (th_type))                                     \
+    TORCH_CHECK(a.device().is_xpu(), "a must be an XPU tensor");               \
+    TORCH_CHECK(b.device().is_xpu(), "b must be an XPU tensor");               \
+    TORCH_CHECK(c.device().is_xpu(), "c must be an XPU tensor");               \
+    TORCH_CHECK(a.sizes() == b.sizes() && b.sizes() == c.sizes(),              \
+                "a/b/c must have the same shape");                             \
+    const int ndim = a.dim();                                                  \
+    const element_type *a_ptr =                                                \
+        reinterpret_cast<const element_type *>(a.data_ptr());                  \
+    const element_type *b_ptr =                                                \
+        reinterpret_cast<const element_type *>(b.data_ptr());                  \
+    element_type *c_ptr = reinterpret_cast<element_type *>(c.data_ptr());      \
+    sycl::queue &queue = c10::xpu::getCurrentXPUStream().queue();              \
+    const size_t n_elem_per_item = (n_elements);                               \
+    int N = 1;                                                                 \
+    for (int i = 0; i < ndim; ++i) {                                           \
+      N *= static_cast<int>(a.size(i));                                        \
+    }                                                                          \
+    size_t global_range = 0;                                                   \
+    size_t local_range = 0;                                                    \
+    if (ndim != 2) {                                                           \
+      /* 非二维张量：展平启动 */                                               \
+      local_range = ELEMS_PER_GROUP / n_elem_per_item;                         \
+      const size_t num_groups =                                                \
+          (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;    \
+      global_range = num_groups * local_range;                                 \
+    } else {                                                                   \
+      const int S = static_cast<int>(a.size(0));                               \
+      const int K = static_cast<int>(a.size(1));                               \
+      const size_t items_per_row = K / n_elem_per_item;                        \
+      if (items_per_row > 0 && items_per_row <= MAX_GROUP_ITEMS &&             \
+          (K % n_elem_per_item) == 0) {                                        \
+        /* 二维且一行放得下：一行一个 work-group */                            \
+        local_range = items_per_row;                                           \
+        global_range = static_cast<size_t>(S) * local_range;                   \
+      } else {                                                                 \
+        /* 行过长/不可整除：回退到展平启动 */                                 \
+        local_range = ELEMS_PER_GROUP / n_elem_per_item;                       \
+        const size_t num_groups =                                              \
+            (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;  \
+        global_range = num_groups * local_range;                               \
+      }                                                                        \
+    }                                                                          \
+    submit_add_##packed_type(queue, a_ptr, b_ptr, c_ptr, N, global_range,      \
+                             local_range);                                     \
+  }
+
+// 实例化 6 个 host 启动函数，分别对应 6 个 kernel：
+//   f32        : float，每 work-item 1 元素
+//   f32x4      : float，每 work-item 4 元素（16 字节向量）
+//   f16        : sycl::half，每 work-item 1 元素
+//   f16x2      : sycl::half，每 work-item 2 元素
+//   f16x8      : sycl::half，每 work-item 8 元素（4 次 4 字节访存）
+//   f16x8_pack : sycl::half，每 work-item 8 元素（128 位打包访存）
+TORCH_BINDING_ELEM_ADD(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_ELEM_ADD(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_ELEM_ADD(f16, torch::kHalf, sycl::half, 1)
+TORCH_BINDING_ELEM_ADD(f16x2, torch::kHalf, sycl::half, 2)
+TORCH_BINDING_ELEM_ADD(f16x8, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_ELEM_ADD(f16x8_pack, torch::kHalf, sycl::half, 8)
+
+// ============================================================================
+// PyTorch C++ 扩展模块入口
+//
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 elementwise_lib）。
+// m.def 把上面生成的 6 个函数注册为 Python 模块里的同名函数，
+// 之后 Python 里就可以直接调用 lib.elementwise_add_f32(...) 等。
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // 逐个把 C++ host 函数暴露给 Python
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f32)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f32x4)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x2)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x8)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x8_pack)
+}
