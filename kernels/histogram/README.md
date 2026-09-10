@@ -40,9 +40,11 @@ export TORCH_XPU_ARCH_LIST="xe-hpg"  # 按实际架构填写，如 pvc、bmg 等
 python3 histogram.py
 ```
 
-预期输出（每个值都出现 1000 次）：
+实测输出（Intel Arc A770，JIT/spir64）：
 
 ```text
+/root/.cache/torch_extensions/py312_cpu/hist_lib
+XPU device: Intel(R) Arc(TM) A770 Graphics
 --------------------------------------------------------------------------------
 h_i32   0: 1000
 h_i32   1: 1000

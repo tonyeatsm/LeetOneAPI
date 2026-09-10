@@ -5,7 +5,7 @@ histogram.py —— 编译并测试 histogram.sycl 中的 2 个 SYCL/oneAPI kern
   1. 用 torch.utils.cpp_extension.load 现场编译 histogram.sycl；
      PyTorch 会识别 .sycl 源文件并交给 icpx（DPC++）编译，同时链接 SYCL/XPU
      运行库（等价于 CUDA 版把 .cu 交给 nvcc）。
-  2. 打印 PyTorch SYCL 扩展的实际构建目录（hist_lib.so 所在位置）；
+  2. 打印 PyTorch SYCL 扩展的实际构建目录（hist_lib.so 所在位置）与 XPU 设备名；
   3. 构造 a = [0, 1, ..., 9] * 1000（长度 10000，元素均为非负整数）；
   4. 分别调用 histogram_i32（标量版）与 histogram_i32x4（int4 向量化版）；
   5. 打印每个桶的计数值，人工核对每个值是否都出现 1000 次。
@@ -58,6 +58,9 @@ lib = load(
 
 # 打印 PyTorch SYCL 扩展的实际构建目录（hist_lib.so 所在位置）
 print(ext._get_build_directory("hist_lib", False))
+
+# 打印当前 XPU 设备名（与 elementwise.py 对齐）
+print(f"XPU device: {torch.xpu.get_device_name(0)}")
 
 # 构造测试数据：0~9 每个值各出现 1000 次，总长度 N = 10 * 1000 = 10000。
 # 元素都是非负 int32；且 N 恰好是 4 的倍数，因此向量化版本不会读到越界数据。

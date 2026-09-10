@@ -295,7 +295,8 @@ host 函数的主要工作：
 1. 用 `torch.utils.cpp_extension.load` 现场编译 `histogram.sycl`
    （`.sycl` 源文件会被 PyTorch 识别，交给 `icpx`/DPC++ 编译并链接 SYCL/XPU 运行库）；
 2. 用 `torch.utils.cpp_extension._get_build_directory("hist_lib", False)` 打印
-   PyTorch SYCL 扩展的实际构建目录（`hist_lib.so` 所在位置）；
+   PyTorch SYCL 扩展的实际构建目录（`hist_lib.so` 所在位置），并用
+   `torch.xpu.get_device_name(0)` 打印 XPU 设备名（与 `elementwise.py` 对齐）；
 3. 生成 `a = [0,1,...,9] * 1000`，长度 `10000`（非负 int32，且是 4 的倍数）；
 4. 分别调用 `histogram_i32` 和 `histogram_i32x4`；
 5. 打印每个桶的计数值。
