@@ -1,0 +1,336 @@
+// ============================================================================
+// histogram.sycl —— 整数直方图统计（histogram）oneAPI/SYCL 教学示例
+//
+// 本文件实现 y[v] = count(a[i] == v)，其中 i = 0 .. N-1。
+// 输入 a 是一维 int32 数组；输出 y 是长度为 M+1 的计数数组，
+// 其中 M = max(a)，桶编号范围正好是 [0, M]。
+//
+// 一句话理解：直方图就是「按值分堆数个数」——
+// 数值相同的元素看成放进了同一个桶，最后统计每个桶里有多少个元素。
+//
+// 例：a = [0, 1, 2, 0, 1, 0]
+//     => y[0] = 3, y[1] = 2, y[2] = 1
+//
+// 对应 LeetCUDA/kernels/histogram/histogram.cu，包含 2 个计算版本：
+//   1. i32   : int32 标量版（每 work-item 1 个元素）
+//   2. i32x4 : int32 向量化版（每 work-item 4 个元素，16 字节访存）
+//
+// 学习重点（可以对照 elementwise 模块一起看）：
+// - 线程编号与越界保护的写法完全相同：
+//     int idx = item.get_global_id(0);   // 相当于 CUDA 的全局线程编号
+//     if (idx < N) ...
+// - 关键差异在“输出下标由谁决定”：
+//     elementwise：c[idx] = a[idx] + b[idx]，输出下标 = work-item 编号，
+//                  一个输出位置只被一个 work-item 写，直接赋值即可；
+//     histogram  ：y[a[idx]] += 1，输出下标 = 数据值，
+//                  多个 work-item 可能同时命中同一个桶 y[v]，
+//                  必须用原子操作（CUDA: atomicAdd / SYCL: atomic_ref）
+//                  把“读-改-写”做成一次原子操作，否则并发累加会丢计数。
+// - 向量化（int4）在这里减少的是访存指令条数；4 次原子加之间的桶冲突依然
+//   存在。热点桶的原子竞争是本模块的主要性能瓶颈，也是后续用局部直方图 /
+//   sub-group 聚合来优化的原因。
+//
+// 须知：本文件严格照搬 CUDA 版 histogram.cu 的算法与启动配置，**包括**
+// histogram_i32x4 缺少 tail 分支的已知缺陷（N % 4 != 0 时会越界读取），
+// 该缺陷在本文件与 docs/histogram/README.md 中照实标注，本次不修复。
+//
+// 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
+// 供 histogram.py 编译与测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
+// ============================================================================
+
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <tuple>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <torch/types.h>
+
+// 常量：与 CUDA 版保持同一套启动策略
+// ELEMS_PER_GROUP：一个 work-group 固定处理的元素数（对应 CUDA 里一个 block
+//                  处理 256 个元素）
+// MAX_GROUP_ITEMS：一个 work-group 的 work-item 数上限（对应 CUDA block 上限 1024）
+#define ELEMS_PER_GROUP 256
+#define MAX_GROUP_ITEMS 1024
+
+// ----------------------------------------------------------------------------
+// 向量类型别名
+// CUDA 的 int4 在 SYCL 中对应 sycl::vec<int, 4>：
+//   int4 -> sycl::vec<int, 4>（4 × 4B = 16 字节）
+// ----------------------------------------------------------------------------
+using int4_vec = sycl::vec<int, 4>;
+
+// ----------------------------------------------------------------------------
+// 访存“重解释（reinterpret）”宏
+//
+// GPU 一次访存指令能搬移的位宽有限。把一段连续内存 reinterpret 成更宽的
+// SYCL 向量类型，可以让编译器生成更宽的 load 指令。
+//
+// 用法示例：
+//   LOAD_INT4(a + idx)  从 a[idx..idx+3] 一次读 16 字节成 vec<int,4>
+//
+// 要求 ptr 对应地址按向量大小对齐；torch 分配的 XPU 张量内存满足要求，
+// 且 idx 取 4 的倍数，因此本文件中的用法保持对齐。
+// ----------------------------------------------------------------------------
+#define LOAD_INT4(ptr) (*reinterpret_cast<const int4_vec *>(ptr))
+
+// ----------------------------------------------------------------------------
+// 原子加 1 辅助函数
+//
+// 直方图的核心：多个 work-item 可能同时给同一个桶 y[v] 加 1，
+// 必须用 sycl::atomic_ref 把“读取 + 加 1 + 写回”做成一条不可分割的原子操作。
+//
+// 模板参数说明：
+//   int                        被操作的数据类型；
+//   memory_order::relaxed      只要求“加 1 不丢”，不需要跨地址的先后顺序，
+//                              是最轻量的序；
+//   memory_scope::device       保证同一设备内所有 work-item 的原子操作互相可见
+//                              （跨 work-group 的竞争也能正确累加）；
+//   address_space::global_space y 是 device USM 全局内存指针。
+//
+// 对应 CUDA 的 atomicAdd(addr, value)；这里 value 固定为 1。
+// ----------------------------------------------------------------------------
+static inline void atomic_add_int(int *addr, int value) {
+  sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                   sycl::memory_scope::device,
+                   sycl::access::address_space::global_space>
+      ref(*addr);
+  ref.fetch_add(value);
+}
+
+// ============================================================================
+// Kernel 1：int32 标量版（最朴素的写法，作为正确性基准）
+// ============================================================================
+//
+// ---- 调用链：谁触发了这个 kernel？ ----
+// histogram.py
+//   └─ lib.histogram_i32(a)                        # Python 调用（pybind11）
+//       └─ histogram_i32(a)                        # C++ host 包装函数（宏生成，
+//                                                  #  运行在 CPU 上）
+//           └─ submit_hist_i32(queue, ...)         # 本函数
+//               └─ queue.submit(parallel_for)      # SYCL 提交（对应 CUDA 启动语法）
+//                   └─ Intel GPU 硬件并行执行 kernel lambda
+//
+// 关键点：
+// - CUDA 用 <<<grid, block>>> 启动 __global__ 函数；SYCL 在 host 端用
+//   queue.submit + parallel_for 提交 kernel lambda；
+// - CUDA kernel 靠 blockIdx/threadIdx 算全局编号；SYCL 靠 nd_item
+//   （这里叫 item）的 get_global_id(0)；
+// - 启动后 GPU 的每个 work-item 都会执行一遍本函数体。
+//
+// nd_range 知识点速查：
+// 1. 一次 parallel_for(nd_range<1>(global, local)) 提交“全部 work-item”；
+//    global 是所有 work-item 数（相当于 CUDA grid * block）；
+//    local 是每个 work-group 的 work-item 数（相当于 CUDA block）；
+// 2. kernel 内可直接从 nd_item 查询：
+//    item.get_global_id(0)   = CUDA 全局线程编号 idx；
+//    item.get_group(0)       = CUDA blockIdx.x（当前是第几个 work-group）；
+//    item.get_local_id(0)    = CUDA threadIdx.x；
+//    item.get_local_range(0) = CUDA blockDim.x；
+// 3. 例：parallel_for(nd_range<1>(1024, 256))、N = 1000：
+//    - 共 1024 个 work-item，每 256 个一组，共 4 组；
+//    - group 0/1/2/3 分别负责 0~255、256~511、512~767、768~1023；
+//    - 下标 1000~1023 共 24 个 work-item 被 if (idx < N) 拦截，不参与计算；
+// 4. 同一个 kernel lambda 可以多次 submit，每次产生一次独立并行执行。
+//
+// ---- 为什么这里必须用原子操作 ----
+// elementwise 中一个输出位置只被一个 work-item 写，所以可以放心地直接赋值：
+//     c[idx] = a[idx] + b[idx];
+// 本 kernel 的输出位置由数据值决定：
+//     int v = a[idx];   // 桶编号
+//     y[v] += 1;        // 多个 work-item 可能同时写同一个 y[v]
+// 两个 work-item 同时执行“读-改-写”时会发生竞争：
+//     work-item 0: read  y[v] = 0
+//     work-item 1: read  y[v] = 0
+//     work-item 0: write y[v] = 1
+//     work-item 1: write y[v] = 1   // 本应得到 2，实际得到 1，丢了一次计数
+// atomic_add_int(&y[v], 1)（内部是 sycl::atomic_ref::fetch_add）把
+// “读取 + 加 1 + 写回”交给硬件作为一条不可分割的原子操作完成。
+//
+// 约定启动方式（与 elementwise 相同）：每个 work-group 有 256 个 work-item，
+// 每 work-item 负责 1 个元素，因此每个 work-group 处理 256 个元素，
+// work-group 数量取 (N + 255) / 256（向上取整）。
+//
+// 参数：
+//   a : 输入数组（设备端指针），元素为非负整数，其值就是桶编号
+//   y : 输出数组（设备端指针），长度为 M+1，存放每个桶的计数
+//   N : 元素个数
+// ============================================================================
+static void submit_hist_i32(sycl::queue &queue, const int *a, int *y, int N,
+                            size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    // nd_range 分两层：global（总 work-item 数）与 local（每个 work-group 大小）
+    h.parallel_for<class HistogramI32Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        // [=]：kernel lambda 只能按值捕获设备可访问的指针/标量
+        [=](sycl::nd_item<1> item) {
+          // 全局 work-item 编号：get_global_id(0) 相当于 CUDA 的
+          // blockIdx.x * blockDim.x + threadIdx.x
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 越界保护：N 不一定是启动 work-item 总数的整数倍，多余的不参与计算
+          if (idx < N)
+            // a[idx] 给出桶编号，把该桶的计数原子加 1；
+            // 必须用原子操作，原因见上方“为什么这里必须用原子操作”
+            atomic_add_int(&y[a[idx]], 1);
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 2：int32 向量化版（vec<int,4> = 4 个 int = 16 字节）
+// ============================================================================
+// 每个 work-item 连续处理 4 个元素，用一次 16 字节的向量 load
+// 代替 4 次 4 字节访存，从而减少访存指令条数；
+// 读进来之后再对 vec<int,4> 的 4 个分量分别做原子加。
+//
+// host 端对应启动：local = 256 / 4 = 64 个 work-item，每个 work-group
+// 仍处理 256 个元素。
+//
+// 与 elementwise 的 f32x4 对照：
+// - elementwise 的 f32x4 用 (idx + 3) < N 判断整段是否越界，
+//   并在尾部（tail）退回标量循环，保证任意 N 都正确；
+// - 本 kernel 目前只判断了 idx < N，没有 tail 分支：
+//   当 N 不是 4 的整数倍时，最后一个 work-item 的 LOAD_INT4(a + idx) 会越界
+//   读取 1~3 个元素。当前测试数据长度为 10000（4 的倍数），因此没有暴露该问题。
+//   本模块严格照搬 CUDA 版行为，该问题原样保留，供后续单独修复。
+// ============================================================================
+static void submit_hist_i32x4(sycl::queue &queue, const int *a, int *y, int N,
+                              size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class HistogramI32x4Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
+          int idx = 4 * static_cast<int>(item.get_global_id(0));
+          // 注意：这里只保证起点 idx 不越界，不保证 idx+1..idx+3 也不越界
+          if (idx < N) {
+            // 把 a[idx..idx+3] 的 16 字节 reinterpret 成 vec<int,4>，一次读入
+            int4_vec reg_a = LOAD_INT4(a + idx);
+            // vec<int,4> 有 4 个分量，逐个原子加 1
+            atomic_add_int(&y[reg_a[0]], 1);
+            atomic_add_int(&y[reg_a[1]], 1);
+            atomic_add_int(&y[reg_a[2]], 1);
+            atomic_add_int(&y[reg_a[3]], 1);
+          }
+        });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
+// #str 会把参数按字面内容生成字符串，例如 STRINGFY(add) 得到 "add"。
+// ----------------------------------------------------------------------------
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+// ----------------------------------------------------------------------------
+// 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype，
+// 否则打印张量信息并抛出运行时异常，避免把错误类型交给 kernel。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
+  if (((T).options().dtype() != (th_type))) {                                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
+    throw std::runtime_error("values must be " #th_type);                      \
+  }
+
+// ----------------------------------------------------------------------------
+// 形状检查宏：校验张量第 0 维是否等于期望长度。
+// 本文件当前的 host 函数没有用到它（输入长度由 a.size(0) 动态取得），
+// 保留是为了与其他 kernel 文件保持一致的宏集合。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_SHAPE(T, S0)                                        \
+  if (((T).size(0) != (S0))) {                                                 \
+    throw std::runtime_error("Tensor size mismatch!");                         \
+  }
+
+// ============================================================================
+// host 启动函数生成宏
+//
+// 宏参数：
+//   packed_type : 命名后缀，如 i32 / i32x4
+//   th_type     : 对应的 torch dtype（本文件两个版本都是 torch::kInt32）
+//   element_type: kernel 中的 C++ 数据类型（本文件两个版本都是 int）
+//   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度，1 或 4）
+//
+// 展开后生成形如 histogram_i32(torch::Tensor a) 的 host 函数，
+// 它依次做四件事：
+//   1. 校验输入张量的 dtype 是 int32，且位于 XPU 设备上；
+//   2. 用 torch::max(a, 0) 求最大值 M，再创建长度 M+1 的输出桶数组 y，
+//      于是桶编号范围正好是 [0, M]，初始计数为 0；
+//   3. 计算 nd_range 的 global / local：每个 work-group 固定处理 256 个元素，
+//      所以 local = 256 / n_elements，group 数 = ceil(N / 256)，
+//      global = group 数 * local；
+//   4. 用 data_ptr() 取裸指针，从当前 XPU stream 取 sycl::queue 提交 kernel，
+//      最后返回 y。
+//
+// 注意 torch::max(a, 0) 返回的是 (values, indices) 这个 tuple，
+// 这里只取 values（std::get<0>），再用 .cpu() 搬到主机端读成 int。
+// 因此输出桶数由输入数据的最大值动态决定，输入必须是非负整数。
+//
+// 宏内注释统一使用 /* ... */ 块注释：宏定义每行以 \ 续行，用 // 会把该行末尾的
+// 续行符一起注释掉，导致宏定义断开；块注释在预处理阶段被替换为空格，不影响续行。
+// ============================================================================
+#define TORCH_BINDING_HIST(packed_type, th_type, element_type, n_elements)     \
+  torch::Tensor histogram_##packed_type(torch::Tensor a) {                     \
+    /* ① dtype 检查：输入必须是 th_type（本文件展开为 torch::kInt32） */       \
+    CHECK_TORCH_TENSOR_DTYPE(a, (th_type))                                     \
+    /* ② 设备检查：kernel 只在 Intel GPU 上执行，要求输入在 XPU 上 */         \
+    TORCH_CHECK(a.device().is_xpu(), "a must be an XPU tensor");               \
+    /* ③ 张量选项：沿用输入设备，dtype 固定为 int32（桶计数的类型） */         \
+    auto options = a.options().dtype(torch::kInt32);                           \
+    /* ④ N：输入元素总数，直方图要统计这 N 个元素 */                           \
+    const int N = a.size(0);                                                   \
+    /* ⑤ 求最大值：torch::max(a, 0) 返回 (values, indices) 二元组 */           \
+    std::tuple<torch::Tensor, torch::Tensor> max_a = torch::max(a, 0);         \
+    /* ⑥ 只取 values（第 0 个）并搬到 CPU 读成普通 int */                      \
+    torch::Tensor max_val = std::get<0>(max_a).cpu();                          \
+    /* ⑦ M：输入最大值，也就是最大的桶编号 */                                  \
+    const int M = max_val.item().to<int>();                                    \
+    /* ⑧ 建输出桶数组：长度 M + 1（桶编号 0..M），初值全 0 */                  \
+    auto y = torch::zeros({M + 1}, options);                                   \
+    /* ⑨ 取输入裸指针（XPU 张量内存即 SYCL USM，可直接交给 kernel） */         \
+    const element_type *a_ptr =                                                \
+        reinterpret_cast<const element_type *>(a.data_ptr());                  \
+    /* ⑩ 取输出裸指针 */                                                       \
+    element_type *y_ptr = reinterpret_cast<element_type *>(y.data_ptr());      \
+    /* ⑪ 从当前 XPU stream 取 sycl::queue，保证与 PyTorch 流一致 */           \
+    sycl::queue &queue = c10::xpu::getCurrentXPUStream().queue();              \
+    /* ⑫ 每个 work-group 处理 256 个元素，local = 256 / n_elements */          \
+    const size_t local_range = ELEMS_PER_GROUP / (n_elements);                 \
+    /* ⑬ group 数 = ceil(N / 256)，加 255 再整除即向上取整 */                  \
+    const size_t num_groups =                                                  \
+        (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;      \
+    /* ⑭ global = group 数 * local（nd_range 的 global 必须是 local 的整数倍）*/\
+    const size_t global_range = num_groups * local_range;                      \
+    /* ⑮ 提交对应 kernel（名字由 packed_type 拼接） */                         \
+    submit_hist_##packed_type(queue, a_ptr, y_ptr, N, global_range,            \
+                              local_range);                                    \
+    /* ⑯ 把结果张量 y 返回给 Python 侧 */                                      \
+    return y;                                                                  \
+  }
+
+// 实例化 2 个 host 启动函数，分别对应 2 个 kernel：
+//   i32   : int，每 work-item 1 元素，local = 256 个 work-item
+//   i32x4 : int，每 work-item 4 元素（int4），local = 256 / 4 = 64 个 work-item
+TORCH_BINDING_HIST(i32, torch::kInt32, int, 1)
+TORCH_BINDING_HIST(i32x4, torch::kInt32, int, 4)
+
+// ============================================================================
+// PyTorch C++ 扩展模块入口
+//
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 hist_lib）。
+// m.def 把上面生成的两个函数注册为 Python 模块里的同名函数，
+// 之后 Python 里就可以直接调用 lib.histogram_i32(...) 与
+// lib.histogram_i32x4(...)。
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // 逐个把 C++ host 函数暴露给 Python
+  TORCH_BINDING_COMMON_EXTENSION(histogram_i32)
+  TORCH_BINDING_COMMON_EXTENSION(histogram_i32x4)
+}

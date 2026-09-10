@@ -80,16 +80,19 @@ python3 -c "import torch; print(torch.__version__); print(torch.xpu.get_device_n
 ```bash
 sudo docker start leetoneapi 
 sudo docker exec -it leetoneapi /bin/bash
-cd /workspace/LeetOneAPI
 source /workspace/LeetOneAPI/.venv/bin/activate
 
 # 打印 Intel GPU 型号与 XPU 可用性
 cd /workspace/LeetOneAPI/kernels/elementwise
 python3 -c "import torch; print('XPU =', torch.xpu.get_device_name(0)); print('xpu available =', torch.xpu.is_available())"
 
-# 执行elementwise（.sycl 会在第一次运行时现场编译，耗时较长）
+# 逐元素
 cd /workspace/LeetOneAPI/kernels/elementwise
 python3 elementwise.py
+
+# 直方图统计
+cd /workspace/LeetOneAPI/kernels/histogram
+python3 histogram.py
 
 ```
 
