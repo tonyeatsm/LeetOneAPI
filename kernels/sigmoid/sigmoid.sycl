@@ -1,0 +1,583 @@
+// ============================================================================
+// sigmoid.sycl —— Intel oneAPI/SYCL Sigmoid（S 型激活函数）教学示例
+//
+// 本文件实现 y[i] = 1 / (1 + exp(-x[i]))，数组长度为 N。
+// 所有 kernel 都把输入输出当作“一维数组”看待，二维 (S, K) 矩阵在启动端
+// 展平成 N = S * K。
+//
+// 对应 LeetCUDA/kernels/sigmoid/sigmoid.cu，包含 6 个计算版本：
+//   1. f32         : FP32 标量版（每 work-item 1 个元素）
+//   2. f32x4       : FP32 向量化版（每 work-item 4 个元素，16 字节访存）
+//   3. f16         : FP16 标量版（sycl::half，每 work-item 1 个元素）
+//   4. f16x2       : FP16 每 work-item 2 个元素（4 字节访存）
+//   5. f16x8       : FP16 每 work-item 8 个元素（4 次 4 字节访存，unpack 写法）
+//   6. f16x8_pack  : FP16 每 work-item 8 个元素（一次 16 字节/128 位访存）
+//
+// 与 elementwise 模块的关系：
+// 本文件的 6 个版本与 kernels/elementwise/elementwise.sycl 的 6 个版本一一对应，
+// 区别只是把 “c[i] = a[i] + b[i]” 换成 “y[i] = sigmoid(x[i])”，
+// 且 sigmoid 是**单输入算子**（只读 x 一份数据，不像加法要读 a、b 两份）。
+// 线程编号、向量化访存、FP16 打包等通用知识不再重复，下面重点说明
+// sigmoid 特有的两点：
+//   - 数值稳定性：exp 的溢出边界与 clamp（先夹取再取指数）；
+//   - 数据类型精度：half 运算必须用内建函数，常数 1.0 要用 sycl::half(1.0f) 转。
+//
+// 学习重点：
+// - 全局 work-item 编号 = item.get_global_id(0)
+// - 越界保护：if (idx < N)
+// - exp 溢出保护：把 x 限制在 exp 不溢出的区间，再做 1/(1+exp(-x))
+// - 向量化 / 更宽访存 / FP16 都是逐元素算子的常见优化手段
+//
+// 须知：本文件严格照搬 CUDA 版 sigmoid.cu 的算法与启动配置，**包括**
+// f32x4 / f16x2 / f16x8 只判断段首下标、缺少 tail 分支（N 不是向量宽度整数倍
+// 时会越界写），以及 f16x8_pack 尾部不足 8 个元素整段漏算的已知缺陷；
+// 这些缺陷在本文件与 docs/sigmoid/README.md 中照实标注，本次不修复。
+//
+// 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
+// 供 sigmoid.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
+// ============================================================================
+
+// ============================================================================
+// 【Sigmoid 曲线速览】一张小图看懂这个激活函数
+//
+//   y = 1 / (1 + e^(-x))
+//
+//  1.0 ┤                     **********
+//      ┤                  ***
+//      ┤                **
+//  0.5 ┤               +
+//      ┤             **
+//      ┤          ***
+//  0.0 ┤**********
+//       └──────────────────────────────→ x
+//       -6      -3     0      3       6
+//
+// 采样值：-6→0.0025、-3→0.0474、0→0.5000、3→0.9526、6→0.9975
+//
+// 读图要点：
+// - S 形、单调递增：左边贴近 0、右边贴近 1，中间平滑过渡；
+// - 值域恒为 (0, 1) 开区间，输出可解释为概率 / 门控开关；
+// - 关于 (0, 0.5) 中心对称：sigmoid(-x) = 1 - sigmoid(x)；
+//   导数 sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))，在 x = 0 处最大（0.25），
+//   所以中心附近最敏感、近似线性；
+// - 两端饱和：|x| 超过约 8 后输出几乎不再变化，这就是下文 kernel 先做 clamp(截断)
+//   再算 exp 的依据——饱和后的钳位不改变结果，却能避免 exp 溢出；
+// - 作为激活函数：它给网络引入非线性（否则多层线性变换叠加仍是线性变换）；
+//   缺点是两端导数趋近 0，深网络容易梯度消失，现代隐藏层多用 ReLU，
+//   但二分类输出层、LSTM 门控等仍常见。
+// ============================================================================
+
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <torch/types.h>
+
+// 常量：与 CUDA 版保持同一套启动策略
+// ELEMS_PER_GROUP：一个 work-group 固定处理的元素数（对应 CUDA 里一个 block
+//                  处理 256 个元素）
+// MAX_GROUP_ITEMS：一个 work-group 的 work-item 数上限（对应 CUDA block 上限 1024）
+#define ELEMS_PER_GROUP 256
+#define MAX_GROUP_ITEMS 1024
+
+// ----------------------------------------------------------------------------
+// 向量类型别名
+// CUDA 的 float4 / half2 在 SYCL 中对应 sycl::vec<T, N>：
+//   float4 -> sycl::vec<float, 4>（4 × 4B = 16 字节）
+//   half2  -> sycl::vec<sycl::half, 2>（2 × 2B = 4 字节）
+//   half8  -> sycl::vec<sycl::half, 8>（8 × 2B = 16 字节，一次 128 位访存）
+// ----------------------------------------------------------------------------
+using float4_vec = sycl::vec<float, 4>;
+using half2_vec = sycl::vec<sycl::half, 2>;
+using half8_vec = sycl::vec<sycl::half, 8>;
+
+// ----------------------------------------------------------------------------
+// 访存“重解释（reinterpret）”宏
+//
+// GPU 一次访存指令能搬移的位宽有限。把一段连续内存 reinterpret 成更宽的
+// SYCL 向量类型，可以让编译器生成更宽的 load/store 指令。
+//
+// 用法示例：
+//   LOAD_FLOAT4(x + idx)        从 x[idx..idx+3] 一次读 16 字节成 vec<float,4>
+//   STORE_FLOAT4(y + idx, val)  把 16 字节的 vec<float,4> 一次写回
+//
+// 要求 ptr 对应地址按向量大小对齐；torch 分配的 XPU 张量内存满足要求，
+// 且 idx 取 4/2/8 的倍数，因此本文件中的用法保持对齐。
+// ----------------------------------------------------------------------------
+#define LOAD_FLOAT4(ptr) (*reinterpret_cast<const float4_vec *>(ptr))
+#define STORE_FLOAT4(ptr, value) (*reinterpret_cast<float4_vec *>(ptr) = (value))
+
+#define LOAD_HALF2(ptr) (*reinterpret_cast<const half2_vec *>(ptr))
+#define STORE_HALF2(ptr, value) (*reinterpret_cast<half2_vec *>(ptr) = (value))
+
+#define LOAD_HALF8(ptr) (*reinterpret_cast<const half8_vec *>(ptr))
+#define STORE_HALF8(ptr, value) (*reinterpret_cast<half8_vec *>(ptr) = (value))
+
+// ----------------------------------------------------------------------------
+// exp 溢出保护边界
+//
+// sigmoid 要算 exp(-x)，而 exp 的参数太大会溢出成 inf，太小会下溢成 0，
+// 所以本文件先把输入 x 夹在 [MIN_EXP, MAX_EXP] 区间内，再去算指数。
+//
+// F32：MAX_EXP_F32 = 88.3762626647949f ≈ ln(2^127.5)，
+//      略小于 ln(FLT_MAX) ≈ 88.723，是逐元素 sigmoid 常用的保守上界；
+//      exp 的参数落在 ±88.376 内时结果一定是有限值，不会 inf 也不会 0。
+// F16：half 的取值范围比 float 窄得多——
+//      MAX_EXP_F16 = ln(65504) ≈ 11.09，65504 是 half 的最大规格数；
+//      MIN_EXP_F16 = ln(2^-14) ≈ -9.70，2^-14 是 half 的最小规格正数。
+//      两个边界不对称，是因为 half 能表示的正数范围本身就偏向 0 一侧。
+//
+// sigmoid 在两端是饱和的：|x| 超出这些边界后，结果在对应精度下已经是 1.0
+// 或 0.0，因此钳位不会改变最终可表示的结果。
+//
+// 对应关系：
+//   CUDA: fminf/fmaxf 作用于 float，__hmin/__hmax 直接比较 16 位 half；
+//   SYCL: sycl::fmin/sycl::fmax 对 float 与 sycl::half 都有重载。
+//   常数用 sycl::half(...) 显式转成 half，对应 CUDA 的 __float2half(...)。
+// ----------------------------------------------------------------------------
+#define MAX_EXP_F32 88.3762626647949f
+#define MIN_EXP_F32 (-88.3762626647949f)
+#define MAX_EXP_F16 sycl::half(11.089866488461016f)
+#define MIN_EXP_F16 sycl::half(-9.704060527839234f)
+
+// ----------------------------------------------------------------------------
+// half 版辅助函数
+//
+// 1. clamp_exp_f16：把输入夹到“hexp 不溢出”的区间，
+//    对应 CUDA 的 __hmin(__hmax(v, MIN_EXP_F16), MAX_EXP_F16)；
+// 2. h_exp：half 版指数，对应 CUDA 的 hexp（没有成对的 half2 版本，
+//    所以向量化版本里两个分量仍要分别调用）。
+// ----------------------------------------------------------------------------
+static inline sycl::half clamp_exp_f16(sycl::half v) {
+  return sycl::fmin(sycl::fmax(v, MIN_EXP_F16), MAX_EXP_F16);
+}
+
+static inline sycl::half h_exp(sycl::half v) { return sycl::exp(v); }
+
+// ============================================================================
+// Kernel 1：FP32 标量版（最朴素写法，作为正确性基准）
+// ============================================================================
+//
+// ---- 调用链：谁触发了这个 kernel？ ----
+// sigmoid.py
+//   └─ lib.sigmoid_f32(x, y)                     # Python 调用（pybind11）
+//       └─ sigmoid_f32(torch::Tensor x, y)       # C++ host 包装函数（宏生成，
+//                                                #  运行在 CPU 上）
+//           └─ submit_sigmoid_f32(queue, ...)    # 本函数
+//               └─ queue.submit(parallel_for)    # SYCL 提交（对应 CUDA 启动语法）
+//                   └─ Intel GPU 硬件并行执行 kernel lambda
+//
+// 关键点：
+// - CUDA 用 <<<grid, block>>> 启动 __global__ 函数；SYCL 在 host 端用
+//   queue.submit + parallel_for 提交 kernel lambda；
+// - CUDA kernel 靠 blockIdx/threadIdx 算全局编号；SYCL 靠 nd_item
+//   （这里叫 item）的 get_global_id(0)；
+// - 启动后 GPU 的每个 work-item 都会执行一遍本函数体。
+//
+// 与 elementwise 的差异：这是单输入算子，只有 x 一路读、y 一路写，
+// 但每个元素多了一次 exp 计算。
+//
+// 参数：
+//   x : 输入数组（设备端指针）
+//   y : 输出数组
+//   N : 元素个数
+// ============================================================================
+static void submit_sigmoid_f32(sycl::queue &queue, const float *x, float *y,
+                               int N, size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    // nd_range 分两层：global（总 work-item 数）与 local（每个 work-group 大小）
+    h.parallel_for<class SigmoidF32Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        // [=]：kernel lambda 只能按值捕获设备可访问的指针/标量
+        [=](sycl::nd_item<1> item) {
+          // 全局 work-item 编号：get_global_id(0) 相当于 CUDA 的
+          // blockIdx.x * blockDim.x + threadIdx.x
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 越界保护：N 不一定是启动 work-item 总数的整数倍，多余的不参与计算
+          if (idx < N) {
+            // 1) 数值保护：把 v 夹在 exp 不会溢出的区间内。
+            //    这里只做比较与夹取，不改变饱和区的最终结果。
+            float v = sycl::fmin(sycl::fmax(x[idx], MIN_EXP_F32), MAX_EXP_F32);
+            // 2) 计算 sigmoid：clamp 之后 exp(-v) 一定是有限非零值，
+            //    1 + exp(-v) 不会变成 inf，结果稳定落在 (0, 1) 内。
+            y[idx] = 1.0f / (1.0f + sycl::exp(-v));
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 2：FP32 向量化版（vec<float,4> = 4 个 float = 16 字节）
+// ============================================================================
+// 每个 work-item 连续处理 4 个元素，一次 16 字节的向量 load/store
+// 代替 4 次 4 字节访存，从而减少访存指令条数。
+//
+// 与 elementwise 的 f32x4 不同，sigmoid 是单输入算子：只读 x 一份数据，
+// 没有 b 侧的第二路 load。
+//
+// 注意“向量化”省的只是访存指令：计算仍要按 4 个分量逐条展开，
+// 而且每个分量都要做一次 exp，属于计算偏重的逐元素算子，
+// 因此向量化带来的加速比通常不如 elementwise 加法明显。
+//
+// host 端对应启动：local = 256 / 4 = 64 个 work-item，每个 work-group
+// 仍处理 256 个元素。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：只判断了 (idx + 0) < N，
+// 没有像 elementwise 的 f32x4 那样用 (idx + 3) < N 判断整段 4 个元素是否齐全，
+// 也没有尾部（tail）逐元素回退分支。当 N 不是 4 的整数倍时，末尾 work-item
+// 会把 idx+1..idx+3 写到 y 的合法范围之外，且最后不足 4 个元素不会被正确计算。
+// 本模块基准测试的 S/K 都是 256 的倍数，不会触发该问题。
+// ============================================================================
+static void submit_sigmoid_f32x4(sycl::queue &queue, const float *x, float *y,
+                                 int N, size_t global_range,
+                                 size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SigmoidF32x4Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
+          int idx = 4 * static_cast<int>(item.get_global_id(0));
+          // 读取同样写在判断之外（照搬 CUDA 版）：N 不是 4 的倍数时还会多读
+          // 最多一个向量的数据。
+          float4_vec reg_x = LOAD_FLOAT4(x + idx);
+          float4_vec reg_y;
+          // 对 4 个分量分别 clamp，理由同 Kernel 1
+          for (int i = 0; i < 4; ++i) {
+            reg_x[i] = sycl::fmin(sycl::fmax(reg_x[i], MIN_EXP_F32), MAX_EXP_F32);
+          }
+          // 对 4 个分量分别计算 sigmoid
+          for (int i = 0; i < 4; ++i) {
+            reg_y[i] = 1.0f / (1.0f + sycl::exp(-reg_x[i]));
+          }
+          // 一次 16 字节写回 y[idx..idx+3]；注意这里只判断了段首下标
+          if ((idx + 0) < N) {
+            STORE_FLOAT4(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 3：FP16 标量版
+// ============================================================================
+// sycl::half 是 IEEE 754 半精度浮点，只占 2 字节（float 的一半）。
+// 相同显存带宽下，FP16 理论上能搬运两倍元素，代价是精度更低
+// （half 约 3~4 位十进制有效数字，保守按约 3 位）。
+//
+// sigmoid 用 FP16 计算时有两个必须注意的点（与 CUDA 版一致）：
+// 1. half 没有 float 那样的隐式类型提升，1.0 这类常数要用 sycl::half(1.0f)
+//    显式转成 half （对应 CUDA 的 __float2half(1.0f)），否则参与运算的类型不确定；
+// 2. 指数要用 half 版本的 exp，夹取也用 half 版本的 fmin/fmax
+//    （对应 CUDA 的 hexp / __hmin / __hmax），避免每次计算都插入类型转换。
+// ============================================================================
+static void submit_sigmoid_f16(sycl::queue &queue, const sycl::half *x,
+                               sycl::half *y, int N, size_t global_range,
+                               size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SigmoidF16Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 预先把常数 1.0 转成 half 复用，省掉每个元素重复转换的开销
+          const sycl::half f = sycl::half(1.0f);
+          if (idx < N) {
+            // clamp：把 v 限制在 exp 不溢出的区间（边界见文件开头的 F16 说明）
+            sycl::half v = clamp_exp_f16(x[idx]);
+            // f / (f + exp(-v))：用 half 的指数与除法完成 sigmoid
+            y[idx] = f / (f + h_exp(-v));
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 4：FP16 每 work-item 2 个元素（vec<half,2> = 2 个 half = 4 字节）
+// ============================================================================
+// vec<half,2> 是 2 元素 half 向量，一次 load/store 4 字节，
+// 每 work-item 一次处理 2 个连续元素。
+//
+// 与 elementwise 的 f16x2 有一点不同：加法有现成的成对指令（CUDA __hadd2），
+// 而指数没有对应的成对版本，所以两个分量仍要分别调用 exp。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：同 Kernel 2，只判断 (idx + 0) < N，
+// 缺少尾部处理，N 不是 2 的整数倍时会把 y[idx + 1] 写到范围之外。
+// ============================================================================
+static void submit_sigmoid_f16x2(sycl::queue &queue, const sycl::half *x,
+                                 sycl::half *y, int N, size_t global_range,
+                                 size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SigmoidF16x2Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 2 个连续 half
+          int idx = 2 * static_cast<int>(item.get_global_id(0));
+          const sycl::half f = sycl::half(1.0f);
+          // 从 x[idx..idx+1] 读 4 字节为一个 vec<half,2>（读取仍在判断之外）
+          half2_vec reg_x = LOAD_HALF2(x + idx);
+          half2_vec reg_y;
+          // vec 有两个分量，分别 clamp
+          reg_x[0] = clamp_exp_f16(reg_x[0]);
+          reg_x[1] = clamp_exp_f16(reg_x[1]);
+          // 再分别计算 sigmoid（没有成对的 exp，只能按分量调用）
+          reg_y[0] = f / (f + h_exp(-reg_x[0]));
+          reg_y[1] = f / (f + h_exp(-reg_x[1]));
+          // 一次写回 4 字节（2 个 half）；注意这里只判断了段首下标
+          if ((idx + 0) < N) {
+            STORE_HALF2(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 5：FP16 每 work-item 8 个元素（用 4 次 vec<half,2> 操作完成）
+// ============================================================================
+// 每个 work-item 负责 8 个连续 half，把它们拆成 4 个 vec<half,2>
+// （reg_*_0..3）处理。相比 f16x2，每个 work-item 做更多工作，
+// 能摊薄索引计算等固定开销。
+//
+// 这里的 “unpack” 指：数据在内存里本就是连续的 8 个 half，
+// 本 kernel 不把它整体打包搬运，而是按 half2 逐段读、逐段写。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：写回时逐个 half2 判断起始下标，
+// 只保证段首不越界。当 N 落在 idx+7 时，(idx + 6) < N 依然成立，
+// 会把 y[idx + 7] 写到范围之外；尾部不足 8 个元素也没有回退分支。
+// ============================================================================
+static void submit_sigmoid_f16x8(sycl::queue &queue, const sycl::half *x,
+                                 sycl::half *y, int N, size_t global_range,
+                                 size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SigmoidF16x8Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          const sycl::half f = sycl::half(1.0f);
+          // 一次读入 4 个 vec<half,2>：覆盖 x[idx .. idx+7]（读取仍在判断之外）
+          half2_vec reg_x_0 = LOAD_HALF2(x + idx + 0);
+          half2_vec reg_x_1 = LOAD_HALF2(x + idx + 2);
+          half2_vec reg_x_2 = LOAD_HALF2(x + idx + 4);
+          half2_vec reg_x_3 = LOAD_HALF2(x + idx + 6);
+          // 8 个分量分别 clamp（4 个 half2 × 2 个分量）
+          reg_x_0[0] = clamp_exp_f16(reg_x_0[0]);
+          reg_x_0[1] = clamp_exp_f16(reg_x_0[1]);
+          reg_x_1[0] = clamp_exp_f16(reg_x_1[0]);
+          reg_x_1[1] = clamp_exp_f16(reg_x_1[1]);
+          reg_x_2[0] = clamp_exp_f16(reg_x_2[0]);
+          reg_x_2[1] = clamp_exp_f16(reg_x_2[1]);
+          reg_x_3[0] = clamp_exp_f16(reg_x_3[0]);
+          reg_x_3[1] = clamp_exp_f16(reg_x_3[1]);
+          // 结果也用 4 个 vec<half,2> 保存
+          half2_vec reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+          // 8 个分量分别计算 sigmoid
+          reg_y_0[0] = f / (f + h_exp(-reg_x_0[0]));
+          reg_y_0[1] = f / (f + h_exp(-reg_x_0[1]));
+          reg_y_1[0] = f / (f + h_exp(-reg_x_1[0]));
+          reg_y_1[1] = f / (f + h_exp(-reg_x_1[1]));
+          reg_y_2[0] = f / (f + h_exp(-reg_x_2[0]));
+          reg_y_2[1] = f / (f + h_exp(-reg_x_2[1]));
+          reg_y_3[0] = f / (f + h_exp(-reg_x_3[0]));
+          reg_y_3[1] = f / (f + h_exp(-reg_x_3[1]));
+          // 结果写回 y[idx .. idx+7]，逐段判断起始下标（只保证段首不越界）
+          if ((idx + 0) < N) {
+            STORE_HALF2(y + idx + 0, reg_y_0);
+          }
+          if ((idx + 2) < N) {
+            STORE_HALF2(y + idx + 2, reg_y_1);
+          }
+          if ((idx + 4) < N) {
+            STORE_HALF2(y + idx + 4, reg_y_2);
+          }
+          if ((idx + 6) < N) {
+            STORE_HALF2(y + idx + 6, reg_y_3);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 6：FP16 每 work-item 8 个元素（128 位打包版）
+// ============================================================================
+// 8 个 half 恰好是 16 字节 = 128 位。CUDA 版用 float4 做整体 reinterpret；
+// SYCL 版直接使用 vec<half, 8>，把 x[idx..idx+7] 看作一个 16 字节向量，
+// 一次 load/store 128 位，比 Kernel 5 的多条 4 字节访存指令更少。
+//
+// 与 elementwise 的 f16x8_pack 一样，这里的 “pack” 指的是把连续 8 个 half
+// 整体当作 128 位向量搬运；计算部分仍是逐个 half 处理。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：这里只在 (idx + 7) < N 时写回，
+// 末尾不足 8 个元素的整段会被直接丢弃（漏算），但不会像 Kernel 2/4/5 那样越界写。
+// ============================================================================
+static void submit_sigmoid_f16x8_pack(sycl::queue &queue, const sycl::half *x,
+                                      sycl::half *y, int N, size_t global_range,
+                                      size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SigmoidF16x8PackKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          const sycl::half f = sycl::half(1.0f);
+          // 把 x[idx..idx+7] 的 16 字节整体 reinterpret 成 vec<half,8>，
+          // 用一条访存指令读入 128 位（读取仍在判断之外，照搬 CUDA 版）
+          half8_vec pack_x = LOAD_HALF8(x + idx);
+          // 结果也用 128 位向量保存
+          half8_vec pack_y;
+          // 循环展开：每轮处理 1 个 half，共 8 轮
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            // 每个元素先 clamp，再算 f / (f + exp(-v))
+            sycl::half v = clamp_exp_f16(pack_x[i]);
+            pack_y[i] = f / (f + h_exp(-v));
+          }
+          // 结果 pack_y[0..7] 共 128 位，一条 store 指令整体写回 y[idx..idx+7]
+          if ((idx + 7) < N) {
+            STORE_HALF8(y + idx, pack_y);
+          }
+        });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
+// #str 会把参数按字面内容生成字符串，例如 STRINGFY(sigmoid_f32) 得到
+// "sigmoid_f32"。
+// ----------------------------------------------------------------------------
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+// ----------------------------------------------------------------------------
+// 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype，
+// 否则打印张量信息并抛出运行时异常，避免把错误类型交给 kernel。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
+  if (((T).options().dtype() != (th_type))) {                                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
+    throw std::runtime_error("values must be " #th_type);                      \
+  }
+
+// ============================================================================
+// host 启动函数生成宏
+//
+// 宏参数：
+//   packed_type : 命名后缀，如 f32 / f32x4 / f16x8_pack
+//   th_type     : 对应的 torch dtype（torch::kFloat32 / torch::kHalf）
+//   element_type: kernel 中的 C++ 数据类型（float / sycl::half）
+//   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度）
+//
+// 展开后生成形如 sigmoid_f32(torch::Tensor x, torch::Tensor y) 的函数：
+//   1. 校验输入、输出张量的 dtype 与 XPU 设备，并检查两者形状一致；
+//   2. 根据张量形状计算 nd_range 的 global / local；
+//   3. 用 data_ptr() 拿裸指针并从当前 XPU stream 取 sycl::queue 提交 kernel。
+//
+// 启动策略（与 elementwise 一致）：
+// - 非二维张量：展平成 N，每个 work-group 固定处理 256 个元素，
+//   所以 local = 256 / n_elements，global = ceil(N / 256) * local；
+// - 二维 (S, K)：每行需要的 work-item 数不超过 1024 且能被向量宽度整除时，
+//   采用“一行一个 work-group”（local = K / n_elements，global = S * local）；
+//   否则回退到上面的展平策略。
+//
+// 与 CUDA 版的差异：CUDA 的 TORCH_BINDING_SIGMOID 只判断了
+// (K / n_elements) <= 1024，没有“大于 0”与“能被整除”两项检查；
+// 这里沿用 elementwise 模块的 3 项检查，行不可整除时回退到展平启动，
+// 避免 CUDA 版在 K 不能被向量宽度整除时静默漏算每行末尾几个元素。
+//
+// 宏内注释统一使用 /* ... */ 块注释：宏定义每行以 \ 续行，用 // 会把该行末尾的
+// 续行符一起注释掉，导致宏定义断开；块注释在预处理阶段被替换为空格，不影响续行。
+// ============================================================================
+#define TORCH_BINDING_SIGMOID(packed_type, th_type, element_type, n_elements) \
+  void sigmoid_##packed_type(torch::Tensor x, torch::Tensor y) {              \
+    /* ① dtype 检查：输入输出都必须是 th_type */                              \
+    CHECK_TORCH_TENSOR_DTYPE(x, (th_type))                                    \
+    CHECK_TORCH_TENSOR_DTYPE(y, (th_type))                                    \
+    /* ② 设备检查：kernel 只在 Intel GPU 上执行 */                            \
+    TORCH_CHECK(x.device().is_xpu(), "x must be an XPU tensor");              \
+    TORCH_CHECK(y.device().is_xpu(), "y must be an XPU tensor");              \
+    /* ③ 形状检查：sigmoid 是逐元素算子，输入输出形状必须一致 */              \
+    TORCH_CHECK(x.sizes() == y.sizes(), "x/y must have the same shape");      \
+    /* ④ ndim：二维 (S, K) 单独分支，其余按一维展平 */                        \
+    const int ndim = x.dim();                                                 \
+    /* ⑤ 取输入/输出裸指针（XPU 张量内存即 SYCL USM，可直接交给 kernel） */   \
+    const element_type *x_ptr =                                               \
+        reinterpret_cast<const element_type *>(x.data_ptr());                 \
+    element_type *y_ptr = reinterpret_cast<element_type *>(y.data_ptr());     \
+    /* ⑥ 从当前 XPU stream 取 sycl::queue，保证与 PyTorch 流一致 */           \
+    sycl::queue &queue = c10::xpu::getCurrentXPUStream().queue();             \
+    /* ⑦ 每个 work-item 一次处理的元素个数（向量宽度） */                     \
+    const size_t n_elem_per_item = (n_elements);                              \
+    /* ⑧ N：元素总数，二维时即 S * K */                                       \
+    int N = 1;                                                                \
+    for (int i = 0; i < ndim; ++i) {                                          \
+      N *= static_cast<int>(x.size(i));                                       \
+    }                                                                         \
+    size_t global_range = 0;                                                  \
+    size_t local_range = 0;                                                   \
+    if (ndim != 2) {                                                          \
+      /* 非二维张量：展平启动，每个 work-group 处理 256 个元素 */             \
+      local_range = ELEMS_PER_GROUP / n_elem_per_item;                        \
+      const size_t num_groups =                                               \
+          (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;   \
+      global_range = num_groups * local_range;                                \
+    } else {                                                                  \
+      const int S = static_cast<int>(x.size(0));                              \
+      const int K = static_cast<int>(x.size(1));                              \
+      const size_t items_per_row = K / n_elem_per_item;                       \
+      if (items_per_row > 0 && items_per_row <= MAX_GROUP_ITEMS &&            \
+          (K % n_elem_per_item) == 0) {                                       \
+        /* 二维且一行放得下：一行一个 work-group */                           \
+        local_range = items_per_row;                                          \
+        global_range = static_cast<size_t>(S) * local_range;                  \
+      } else {                                                                \
+        /* 行过长/不可整除：回退到展平启动 */                                 \
+        local_range = ELEMS_PER_GROUP / n_elem_per_item;                      \
+        const size_t num_groups =                                             \
+            (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP; \
+        global_range = num_groups * local_range;                              \
+      }                                                                       \
+    }                                                                         \
+    submit_sigmoid_##packed_type(queue, x_ptr, y_ptr, N, global_range,        \
+                                 local_range);                                \
+  }
+
+// 实例化 6 个 host 启动函数，分别对应 6 个 kernel：
+//   f32         : float，每 work-item 1 元素
+//   f32x4       : float，每 work-item 4 元素（float4）
+//   f16         : sycl::half，每 work-item 1 元素
+//   f16x2       : sycl::half，每 work-item 2 元素（half2）
+//   f16x8       : sycl::half，每 work-item 8 元素（4 次 half2，unpack）
+//   f16x8_pack  : sycl::half，每 work-item 8 元素（128 位打包访存）
+TORCH_BINDING_SIGMOID(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_SIGMOID(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_SIGMOID(f16, torch::kHalf, sycl::half, 1)
+TORCH_BINDING_SIGMOID(f16x2, torch::kHalf, sycl::half, 2)
+TORCH_BINDING_SIGMOID(f16x8, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_SIGMOID(f16x8_pack, torch::kHalf, sycl::half, 8)
+
+// ============================================================================
+// PyTorch C++ 扩展模块入口
+//
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 sigmoid_lib）。
+// m.def 把上面生成的 6 个函数注册为 Python 模块里的同名函数，
+// 之后 Python 里就可以直接调用 lib.sigmoid_f32(...) 等。
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // 逐个把 C++ host 函数暴露给 Python
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f32)
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f32x4)
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f16)
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f16x2)
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f16x8)
+  TORCH_BINDING_COMMON_EXTENSION(sigmoid_f16x8_pack)
+}

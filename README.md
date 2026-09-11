@@ -9,7 +9,8 @@
 At the moment this repository only covers the [📚 Easy](#-easy-kernels) tier, i.e. the modules already ported to oneAPI:
 
 - `elementwise`: `c[i] = a[i] + b[i]`, with FP32/FP16 scalar and vectorized variants;
-- `histogram`: `y[v] = count(a[i] == v)`, an atomics-based counting kernel.
+- `histogram`: `y[v] = count(a[i] == v)`, an atomics-based counting kernel;
+- `sigmoid`: `y[i] = 1 / (1 + exp(-x[i]))`, with FP32/FP16 scalar and vectorized variants.
 
 The focus is not peak performance but understanding how the CUDA programming model maps onto SYCL/oneAPI, and how memory-access optimization ideas (vectorized loads, packing, FP16) carry over to Intel GPUs.
 
@@ -76,6 +77,10 @@ python3 elementwise.py
 # Run histogram (.sycl is compiled on the first run, which takes a while)
 cd /workspace/LeetOneAPI/kernels/histogram
 python3 histogram.py
+
+# Run sigmoid (.sycl is compiled on the first run, which takes a while)
+cd /workspace/LeetOneAPI/kernels/sigmoid
+python3 sigmoid.py
 ```
 
 See [scripts/README.md](./scripts/README.md) for the same steps in a copy-paste friendly form.
@@ -105,8 +110,14 @@ The kernels listed here are the ones already ported from LeetCUDA to oneAPI/SYCL
 | ✔️ [elementwise_add_f16x8_pack](./kernels/elementwise/elementwise.sycl)|f16|/|[link](./kernels/elementwise/)|⭐️⭐️|
 | ✔️ [histogram_i32](./kernels/histogram/histogram.sycl)|i32|/|[link](./kernels/histogram/)|⭐️|
 | ✔️ [histogram_i32x4](./kernels/histogram/histogram.sycl)|i32|/|[link](./kernels/histogram/)|⭐️|
+| ✔️ [sigmoid_f32](./kernels/sigmoid/sigmoid.sycl)|f32|/|[link](./kernels/sigmoid/)|⭐️|
+| ✔️ [sigmoid_f32x4](./kernels/sigmoid/sigmoid.sycl)|f32|/|[link](./kernels/sigmoid/)|⭐️|
+| ✔️ [sigmoid_f16](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️|
+| ✔️ [sigmoid_f16x2](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️|
+| ✔️ [sigmoid_f16x8](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️|
+| ✔️ [sigmoid_f16x8_pack](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️⭐️|
 
-Design notes: [docs/elementwise](./docs/elementwise/) and [docs/histogram](./docs/histogram/).
+Design notes: [docs/elementwise](./docs/elementwise/), [docs/histogram](./docs/histogram/) and [docs/sigmoid](./docs/sigmoid/).
 
 ## 📖 Environment & Build
 

@@ -94,5 +94,9 @@ python3 elementwise.py
 cd /workspace/LeetOneAPI/kernels/histogram
 python3 histogram.py
 
+# 激活函数 sigmoid
+cd /workspace/LeetOneAPI/kernels/sigmoid
+python3 sigmoid.py
+
 ```
 
