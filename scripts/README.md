@@ -98,5 +98,8 @@ python3 histogram.py
 cd /workspace/LeetOneAPI/kernels/sigmoid
 python3 sigmoid.py
 
-```
+# 激活函数 relu
+cd /workspace/LeetOneAPI/kernels/relu
+python3 relu.py
 
+```
