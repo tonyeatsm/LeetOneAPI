@@ -174,4 +174,4 @@ elementwise benchmark done.
 | `torch.cuda` / `.cuda()` | `torch.xpu` / `.xpu()` |
 | `TORCH_CUDA_ARCH_LIST` | `TORCH_XPU_ARCH_LIST` |
 
-详细设计说明见 `../../docs/elementwise/README.md`。
+详细设计说明见 `../../docs/kernels/elementwise/README.md`。

@@ -32,7 +32,7 @@
 //
 // 须知：本文件严格照搬 CUDA 版 histogram.cu 的算法与启动配置，**包括**
 // histogram_i32x4 缺少 tail 分支的已知缺陷（N % 4 != 0 时会越界读取），
-// 该缺陷在本文件与 docs/histogram/README.md 中照实标注，本次不修复。
+// 该缺陷在本文件与 docs/kernels/histogram/README.md 中照实标注，本次不修复。
 //
 // 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
 // 供 histogram.py 编译与测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。

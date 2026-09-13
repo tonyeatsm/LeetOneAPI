@@ -11,6 +11,9 @@ At the moment this repository only covers the [📚 Easy](#-easy-kernels) tier, 
 - `elementwise`: `c[i] = a[i] + b[i]`, with FP32/FP16 scalar and vectorized variants;
 - `histogram`: `y[v] = count(a[i] == v)`, an atomics-based counting kernel;
 - `relu`: `y[i] = max(0, x[i])`, with FP32/FP16 scalar and vectorized variants;
+- `elu`: `y[i] = x > 0 ? x : exp(x) - 1`, with FP32/FP16 scalar and vectorized variants;
+- `gelu`: `y[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`, the tanh approximation;
+- `swish`: `y[i] = x / (1 + exp(-x))` (aka SiLU), with FP32/FP16 scalar and vectorized variants;
 - `sigmoid`: `y[i] = 1 / (1 + exp(-x[i]))`, with FP32/FP16 scalar and vectorized variants.
 
 The focus is not peak performance but understanding how the CUDA programming model maps onto SYCL/oneAPI, and how memory-access optimization ideas (vectorized loads, packing, FP16) carry over to Intel GPUs.
@@ -86,6 +89,18 @@ python3 sigmoid.py
 # Run relu (.sycl is compiled on the first run, which takes a while)
 cd /workspace/LeetOneAPI/kernels/relu
 python3 relu.py
+
+# Run elu (.sycl is compiled on the first run, which takes a while)
+cd /workspace/LeetOneAPI/kernels/elu
+python3 elu.py
+
+# Run gelu (.sycl is compiled on the first run, which takes a while)
+cd /workspace/LeetOneAPI/kernels/gelu
+python3 gelu.py
+
+# Run swish (.sycl is compiled on the first run, which takes a while)
+cd /workspace/LeetOneAPI/kernels/swish
+python3 swish.py
 ```
 
 See [scripts/README.md](./scripts/README.md) for the same steps in a copy-paste friendly form.
@@ -101,7 +116,7 @@ See [scripts/README.md](./scripts/README.md) for the same steps in a copy-paste 
 
 ## 📖 Easy Kernels
 
-The kernels listed here are the ones already ported from LeetCUDA to oneAPI/SYCL. Each name is a Python-callable binding generated in the corresponding `.sycl` file; the linked `docs/` directory holds the design notes. 👉 TIPS: `/` = not supported; `✔️` = implemented; `❔` = TODO.
+The kernels listed here are the ones already ported from LeetCUDA to oneAPI/SYCL. Each name is a Python-callable binding generated in the corresponding `.sycl` file; the linked `docs/kernels/` directory holds the design notes. 👉 TIPS: `/` = not supported; `✔️` = implemented; `❔` = TODO.
 
 ### 📚 Easy ⭐️
 
@@ -121,6 +136,24 @@ The kernels listed here are the ones already ported from LeetCUDA to oneAPI/SYCL
 | ✔️ [relu_f16x2](./kernels/relu/relu.sycl)|f16|/|[link](./kernels/relu/)|⭐️|
 | ✔️ [relu_f16x8](./kernels/relu/relu.sycl)|f16|/|[link](./kernels/relu/)|⭐️|
 | ✔️ [relu_f16x8_pack](./kernels/relu/relu.sycl)|f16|/|[link](./kernels/relu/)|⭐️⭐️|
+| ✔️ [elu_f32](./kernels/elu/elu.sycl)|f32|/|[link](./kernels/elu/)|⭐️|
+| ✔️ [elu_f32x4](./kernels/elu/elu.sycl)|f32|/|[link](./kernels/elu/)|⭐️|
+| ✔️ [elu_f16](./kernels/elu/elu.sycl)|f16|/|[link](./kernels/elu/)|⭐️|
+| ✔️ [elu_f16x2](./kernels/elu/elu.sycl)|f16|/|[link](./kernels/elu/)|⭐️|
+| ✔️ [elu_f16x8](./kernels/elu/elu.sycl)|f16|/|[link](./kernels/elu/)|⭐️|
+| ✔️ [elu_f16x8_pack](./kernels/elu/elu.sycl)|f16|/|[link](./kernels/elu/)|⭐️⭐️|
+| ✔️ [gelu_f32](./kernels/gelu/gelu.sycl)|f32|/|[link](./kernels/gelu/)|⭐️|
+| ✔️ [gelu_f32x4](./kernels/gelu/gelu.sycl)|f32|/|[link](./kernels/gelu/)|⭐️|
+| ✔️ [gelu_f16](./kernels/gelu/gelu.sycl)|f16|/|[link](./kernels/gelu/)|⭐️|
+| ✔️ [gelu_f16x2](./kernels/gelu/gelu.sycl)|f16|/|[link](./kernels/gelu/)|⭐️|
+| ✔️ [gelu_f16x8](./kernels/gelu/gelu.sycl)|f16|/|[link](./kernels/gelu/)|⭐️|
+| ✔️ [gelu_f16x8_pack](./kernels/gelu/gelu.sycl)|f16|/|[link](./kernels/gelu/)|⭐️⭐️|
+| ✔️ [swish_f32](./kernels/swish/swish.sycl)|f32|/|[link](./kernels/swish/)|⭐️|
+| ✔️ [swish_f32x4](./kernels/swish/swish.sycl)|f32|/|[link](./kernels/swish/)|⭐️|
+| ✔️ [swish_f16](./kernels/swish/swish.sycl)|f16|/|[link](./kernels/swish/)|⭐️|
+| ✔️ [swish_f16x2](./kernels/swish/swish.sycl)|f16|/|[link](./kernels/swish/)|⭐️|
+| ✔️ [swish_f16x8](./kernels/swish/swish.sycl)|f16|/|[link](./kernels/swish/)|⭐️|
+| ✔️ [swish_f16x8_pack](./kernels/swish/swish.sycl)|f16|/|[link](./kernels/swish/)|⭐️⭐️|
 | ✔️ [sigmoid_f32](./kernels/sigmoid/sigmoid.sycl)|f32|/|[link](./kernels/sigmoid/)|⭐️|
 | ✔️ [sigmoid_f32x4](./kernels/sigmoid/sigmoid.sycl)|f32|/|[link](./kernels/sigmoid/)|⭐️|
 | ✔️ [sigmoid_f16](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️|
@@ -128,7 +161,7 @@ The kernels listed here are the ones already ported from LeetCUDA to oneAPI/SYCL
 | ✔️ [sigmoid_f16x8](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️|
 | ✔️ [sigmoid_f16x8_pack](./kernels/sigmoid/sigmoid.sycl)|f16|/|[link](./kernels/sigmoid/)|⭐️⭐️|
 
-Design notes: [docs/elementwise](./docs/elementwise/), [docs/histogram](./docs/histogram/), [docs/relu](./docs/relu/) and [docs/sigmoid](./docs/sigmoid/).
+Design notes: [docs/kernels/elementwise](./docs/kernels/elementwise/), [docs/kernels/histogram](./docs/kernels/histogram/), [docs/kernels/relu](./docs/kernels/relu/), [docs/kernels/sigmoid](./docs/kernels/sigmoid/), [docs/kernels/elu](./docs/kernels/elu/), [docs/kernels/gelu](./docs/kernels/gelu/) and [docs/kernels/swish](./docs/kernels/swish/).
 
 ## 📖 Environment & Build
 
@@ -162,7 +195,7 @@ Intel GPU device code can be generated in two ways:
 | `torch.cuda` / `.cuda()` / CUDA stream | `torch.xpu` / `.xpu()` / `c10::xpu` current XPU stream |
 | `TORCH_CUDA_ARCH_LIST` | `TORCH_XPU_ARCH_LIST` |
 
-Both `docs/elementwise/README.md` and `docs/histogram/README.md` explain the mapping in more depth.
+Both `docs/kernels/elementwise/README.md` and `docs/kernels/histogram/README.md` explain the mapping in more depth.
 
 ## 🎉 Acknowledgements
 

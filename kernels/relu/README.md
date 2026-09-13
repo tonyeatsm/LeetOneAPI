@@ -27,7 +27,7 @@
 > `relu_f32x4` / `relu_f16x2` / `relu_f16x8` 只判断段首下标、缺少 tail 分支
 > （`N` 不是向量宽度整数倍时会越界写），`relu_f16x8_pack` 尾部不足 8 个元素的
 > 整段会被直接漏算。基准测试的 `S`、`K` 都是 256 的倍数，不会触发这些问题。
-> 详见 `../../docs/relu/README.md`。
+> 详见 `../../docs/kernels/relu/README.md`。
 
 ## 测试
 
@@ -195,4 +195,4 @@ relu benchmark done.
 | `torch.cuda` / `.cuda()` | `torch.xpu` / `.xpu()` |
 | `TORCH_CUDA_ARCH_LIST` | `TORCH_XPU_ARCH_LIST` |
 
-详细设计说明见 `../../docs/relu/README.md`。
+详细设计说明见 `../../docs/kernels/relu/README.md`。

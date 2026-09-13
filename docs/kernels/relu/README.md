@@ -75,7 +75,7 @@ SYCL/oneAPI，以及访存优化（向量化、FP16、128 位打包）如何跨�
 | `kernels/relu/relu.py` | 用 `torch.utils.cpp_extension.load` 编译 `.sycl` 并执行基准测试 |
 | `kernels/relu/README.md` | 模块使用说明与测试输出 |
 | `scripts/README.md` | oneAPI 容器与运行命令说明 |
-| `docs/relu/README.md` | 本文件，模块设计说明 |
+| `docs/kernels/relu/README.md` | 本文件，模块设计说明 |
 
 ## CUDA → SYCL 概念对照
 
@@ -133,7 +133,7 @@ SYCL/oneAPI，以及访存优化（向量化、FP16、128 位打包）如何跨�
 ## 为什么 ReLU 不需要溢出保护（与 sigmoid 的关键差异）
 
 sigmoid 必须先 `clamp` 再 `exp`，否则 `exp(-x)` 的参数太大就会溢出成 `inf`
-（见 `docs/sigmoid/README.md` 中的 `MAX_EXP_F32` / `MAX_EXP_F16` 说明）。
+（见 `docs/kernels/sigmoid/README.md` 中的 `MAX_EXP_F32` / `MAX_EXP_F16` 说明）。
 ReLU 完全没有这个问题：
 
 | 输入情况 | `relu_f32_kernel` 的结果 |
@@ -487,7 +487,7 @@ ReLU 是单输入算子：每个元素读 1 份、写 1 份，所以等效访存
 1. **ReLU 是彻底的访存带宽瓶颈**：FP32 三个版本都停在 ~411~417 GB/s，
    FP16 最快的版本 ~392 GB/s，与 elementwise / sigmoid 在同一台机器上测到的
    上限完全一致；
-2. **本模块最值得看的一条对照**：把这张表和 `docs/sigmoid/README.md` 里
+2. **本模块最值得看的一条对照**：把这张表和 `docs/kernels/sigmoid/README.md` 里
    同样 `S=4096, K=4096` 的实测数据并排看——sigmoid 每个元素要多算一次 `exp`
    和一次除法，但两组耗时几乎逐行相同（例如 `f32` 0.3221 vs 0.3222 ms、
    `f16x2` 0.1712 vs 0.1717 ms、`f16x8_pack` 0.1739 vs 0.1762 ms）。

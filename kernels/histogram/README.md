@@ -17,7 +17,7 @@
 
 > 说明：本模块严格照搬 CUDA 版的算法与启动配置，**包括** `histogram_i32x4`
 > 缺少尾部分支的已知缺陷（`N % 4 != 0` 时会越界读取）。测试数据长度 `10000`
-> 是 4 的倍数，所以不会触发该问题。详见 `../../docs/histogram/README.md`。
+> 是 4 的倍数，所以不会触发该问题。详见 `../../docs/kernels/histogram/README.md`。
 
 ## 测试
 
@@ -84,4 +84,4 @@ h_i32x4 9: 1000
 | `torch.cuda` / `.cuda()` | `torch.xpu` / `.xpu()` |
 | `TORCH_CUDA_ARCH_LIST` | `TORCH_XPU_ARCH_LIST` |
 
-详细设计说明见 `../../docs/histogram/README.md`。
+详细设计说明见 `../../docs/kernels/histogram/README.md`。

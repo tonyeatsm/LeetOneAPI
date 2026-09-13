@@ -1,11 +1,16 @@
 // ============================================================================
-// relu.sycl —— Intel oneAPI/SYCL ReLU（修正线性单元）教学示例
+// elu.sycl —— Intel oneAPI/SYCL ELU（Exponential Linear Unit，指数线性单元）
+//             教学示例
 //
-// 本文件实现 y[i] = max(0, x[i])，数组长度为 N。
+// 本文件实现 y[i] = elu(x[i])，数组长度为 N：
+//
+//   elu(x) = { x,                    x > 0
+//            { alpha * (exp(x) - 1), x <= 0        （本文件 alpha = 1.0，见 ALPHA 宏）
+//
 // 所有 kernel 都把输入输出当作“一维数组”看待，二维 (S, K) 矩阵在启动端
 // 展平成 N = S * K。
 //
-// 对应 LeetCUDA/kernels/relu/relu.cu，包含 6 个计算版本：
+// 对应 LeetCUDA/kernels/elu/elu.cu，包含 6 个计算版本：
 //   1. f32         : FP32 标量版（每 work-item 1 个元素）
 //   2. f32x4       : FP32 向量化版（每 work-item 4 个元素，16 字节访存）
 //   3. f16         : FP16 标量版（sycl::half，每 work-item 1 个元素）
@@ -13,38 +18,37 @@
 //   5. f16x8       : FP16 每 work-item 8 个元素（4 次 4 字节访存，unpack 写法）
 //   6. f16x8_pack  : FP16 每 work-item 8 个元素（一次 16 字节/128 位访存）
 //
-// 与 elementwise / sigmoid 模块的关系：
-// 本文件的 6 个版本与 kernels/elementwise/elementwise.sycl、
-// kernels/sigmoid/sigmoid.sycl 的 6 个版本一一对应，区别只是把
-// “c[i] = a[i] + b[i]” / “y[i] = sigmoid(x[i])” 换成 “y[i] = max(0, x[i])”。
-// work-item 编号、向量化访存、FP16 打包等通用知识不再重复，下面重点说明
-// ReLU 特有的两点：
-//   - 计算极轻：只有一次取最大值，没有 exp、没有除法，所以
-//     sigmoid 必须做的 clamp / 溢出保护（MAX_EXP_* 宏）在这里完全不需要；
-//   - 与 sigmoid 的模板差异：ReLU 有成对的取最大值指令（CUDA 的 __hmax2，
-//     SYCL 里是 sycl::fmax 的 vec<half,2> 重载），f16x8_pack 的循环
-//     因此可以写成 i += 2；而 sigmoid 没有 hexp2，只能逐个 half 算。
+// 与 elementwise / sigmoid / relu 模块的关系：
+// 本文件的 6 个版本与它们的 6 个版本一一对应，区别只是把
+// “c[i] = a[i] + b[i]” / “y[i] = sigmoid(x[i])” / “y[i] = max(0, x[i])”
+// 换成 “y[i] = elu(x[i])”。work-item 编号、向量化访存、FP16 打包等通用知识
+// 不再重复，下面重点说明 ELU 特有的三点：
+//   - 正半轴和 ReLU 一样是恒等映射，负半轴像 sigmoid 一样指数饱和到 -alpha，
+//     相当于把两者的优点各取一半；
+//   - 负半轴要算一次 sycl::exp，所以它比 ReLU 贵、比 gelu 便宜；
+//   - 指数只出现在负半轴，因此不需要 sigmoid / gelu 那样的 clamp /
+//     溢出保护宏（详见下面的宏定义段）。
 //
 // 学习重点：
 // - 全局 work-item 编号 = item.get_global_id(0)
 // - 越界保护：if (idx < N)
-// - 逐元素算子可以“一个 work-item 算多个元素”，用更宽的访存换更少的访存指令
-// - 当计算量小到可以忽略时，耗时基本由访存决定，
-//   因此本模块也是观察 Intel GPU 显存带宽上限的最佳样本
+// - 三元选择（predicated select）：一条比较 + 两条分支 + 一次选择，
+//   与 ReLU 的一次取最大值相比只是多了一次 exp
+// - 向量化 / 更宽访存 / FP16 都是逐元素算子的常见带宽优化手段
 //
-// 须知：本文件严格照搬 CUDA 版 relu.cu 的算法与启动配置，**包括**
+// 须知：本文件严格照搬 CUDA 版 elu.cu 的算法与启动配置，**包括**
 // f32x4 / f16x2 / f16x8 只判断段首下标、缺少 tail 分支（N 不是向量宽度整数倍
 // 时会越界写），以及 f16x8_pack 尾部不足 8 个元素整段漏算的已知缺陷；
-// 这些缺陷在本文件与 docs/kernels/relu/README.md 中照实标注，本次不修复。
+// 这些缺陷在本文件与 docs/kernels/elu/README.md 中照实标注，本次不修复。
 //
 // 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
-// 供 relu.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
+// 供 elu.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
 // ============================================================================
 
 // ============================================================================
-// 【ReLU 曲线速览】一张小图看懂这个激活函数
+// 【ELU 曲线速览】一张小图看懂这个激活函数
 //
-//   y = max(0, x)
+//   y = x (x > 0)，y = alpha * (exp(x) - 1) (x <= 0)
 //
 //  3.0 ┤                          ***
 //      ┤                       ***
@@ -52,36 +56,41 @@
 //      ┤                 ***
 //  1.0 ┤              ***
 //      ┤           ***
-//  0.0 ┤***********+
+//  0.0 ┤**********+
+//      ┤      ****
+// -0.5 ┤  ****
+// -1.0 ┤*····························  ← 渐近线 y = -alpha = -1
 //      └──────────────────────────────→ x
-//      -3     -2    -1    0    1    2    3
+//      -3   -2   -1    0    1    2    3
 //
-// 采样值：-3→0、-1→0、0→0、1→1、2→2、3→3
-// （负半轴被“整流”成 0，正半轴是恒等映射，这就是 Rectified 的来历）
+// 采样值：-3→-0.9502、-2→-0.8647、-1→-0.6321、0→0、1→1、2→2、3→3
 //
 // 读图要点：
-// - 分段线性：x > 0 时 relu(x) = x，x <= 0 时 relu(x) = 0；
-// - 值域是 [0, +∞)，不像 sigmoid 那样是 (0, 1) 的有界区间，两端都不饱和：
-//   正半轴导数恒为 1，梯度不会随 x 增大而衰减，所以深网络里比 sigmoid
-//   更不容易梯度消失——这是 ReLU 成为现代网络隐藏层默认选择的主因；
-// - 在 x = 0 处不可导（左导 0、右导 1），工程上取次梯度，常用 0；
-// - 负半轴导数恒为 0：若某个神经元的输出长期落在负半轴，它的梯度恒 0、
-//   权重不再更新，即所谓“死亡 ReLU（dead ReLU）”，这也是 leaky ReLU /
-//   GELU / SiLU 等变体出现的动机；
-// - 计算量极低：整个算子只有一次比较/取最大值，没有 exp、没有除法，
-//   所以它既是很好的入门示例，也可以当作同类逐元素算子的性能上限参照。
+// - 正半轴是恒等映射（x > 0 时 elu(x) = x），和 ReLU 完全一致：
+//   不饱和、梯度恒为 1；
+// - 负半轴是指数饱和：x <= 0 时 elu(x) = alpha * (exp(x) - 1)，单调递增、
+//   有界，x → -∞ 时极限是 -alpha；但永远取不到 -alpha，
+//   所以值域是开区间 (-alpha, +∞)；
+// - 在 x = 0 处连续且可导：左导数 exp(0) = 1、右导数 1，两侧相等。
+//   elu(0) 走的是 else 分支，算出来是 exp(0) - 1 = 0，与正半轴严格衔接；
+// - 负半轴导数 exp(x) 恒大于 0：这与 ReLU 的“负半轴梯度恒为 0”形成关键对比，
+//   ELU 不会出现死亡 ReLU（dead ReLU）——负半轴仍然能把梯度回传；
+// - 负半轴输出的是负值而不是硬零，缓解了 ReLU 输出恒非负、
+//   把下一层偏置整体推偏的问题；
+// - 代价是负半轴要算一次指数。因此本模块的性能特征介于 ReLU
+//   （纯访存瓶颈）和 sigmoid（计算偏重）之间。
 //
-// 与 sigmoid 的对照（下文会反复引用这张表）：
-//   | 对比项     | sigmoid                      | relu                         |
-//   | 公式       | 1 / (1 + exp(-x))            | max(0, x)                    |
-//   | 值域       | (0, 1)，两端饱和             | [0, +∞)，正半轴不饱和        |
-//   | 每元素计算 | 一次 exp + 一次加法 + 一次除法 | 一次取最大值               |
-//   | 溢出保护   | 必须 clamp 后再 exp          | 不需要（见下面的宏定义段）   |
-//   | 成对指令   | 无 hexp2，只能逐分量算       | 有 __hmax2，一次算 2 个 half |
+// 与 sigmoid / relu 的对照（下文会反复引用这张表）：
+//   | 对比项     | sigmoid                    | relu              | elu (alpha=1)          |
+//   | 公式       | 1 / (1 + exp(-x))          | max(0, x)         | x>0 ? x : exp(x)-1     |
+//   | 值域       | (0, 1)，两端饱和           | [0, +∞)，仅负端   | (-1, +∞)，仅负端饱和   |
+//   | x=0 处     | 可导，导数 0.25            | 不可导（左0右1）  | 可导，导数 1           |
+//   | 负半轴梯度 | 趋近 0（饱和）             | 恒为 0（死亡）    | exp(x) > 0（衰减但非0）|
+//   | 溢出保护   | 需要 clamp                 | 不需要            | 不需要（指数只在负半轴）|
 // ============================================================================
 
-// 头文件列表与 elementwise / sigmoid 保持一致（其中若干头文件本模块没有
-// 直接使用，保留是为了方便几个模块对照阅读）。CUDA 版的 cuda_fp16.h /
+// 头文件列表与 elementwise / relu / sigmoid 保持一致（其中若干头文件本模块
+// 没有直接使用，保留是为了方便几个模块对照阅读）。CUDA 版的 cuda_fp16.h /
 // cuda_runtime.h / float.h / stdio.h / stdlib.h 在 SYCL 侧不需要，
 // half 类型与数学函数都由 <sycl/sycl.hpp> 提供。
 #include <algorithm>
@@ -135,58 +144,76 @@ using half8_vec = sycl::vec<sycl::half, 8>;
 #define LOAD_HALF8(ptr) (*reinterpret_cast<const half8_vec *>(ptr))
 #define STORE_HALF8(ptr, value) (*reinterpret_cast<half8_vec *>(ptr) = (value))
 
-// 把 pack 数组里第 i 个 half 起的 2 个 half（4 字节）当成一个 vec<half,2>，
-// 对应 CUDA 版 relu.cu 里的 HALF2(pack_x[i]) 宏。
-#define HALF2_AT(ptr) (*reinterpret_cast<half2_vec *>(ptr))
+// ----------------------------------------------------------------------------
+// ALPHA：ELU 的负半轴缩放系数
+//
+//   elu(x) = x (x > 0)，alpha * (exp(x) - 1) (x <= 0)
+//
+// 本文件取 alpha = 1.0f，与 PyTorch 的 torch.nn.functional.elu 默认值一致。
+// FP32 版本直接使用这个 float 宏；FP16 版本则用 sycl::half(ALPHA) 现场转换
+// （参数是字面量，编译器会把它折叠成 half 常量，无运行时开销）。
+// ----------------------------------------------------------------------------
+#define ALPHA 1.0f
 
 // ----------------------------------------------------------------------------
-// ReLU 的 half 版辅助函数
+// 为什么本文件没有 sigmoid / gelu 那样的 MAX_EXP_* / MIN_EXP_* 溢出保护宏？
 //
-// 1. h_relu：标量 half 取最大值，对应 CUDA 的
-//    __hmax(__float2half(0.0f), v)。必须用 half 重载，写成 float 版本会先
-//    提升到 float、算完再转回来，多出两条转换指令。
-// 2. h_relu2：成对 half 取最大值，对应 CUDA 的 __hmax2(v, z2)，
-//    一次处理 vec<half,2> 里的 2 个分量（是否最终合成一条成对指令由后端决定，
-//    但语义与 CUDA 的 __hmax2 一致，且写法上让循环可以按 i += 2 推进）。
-//    与 sigmoid 的对照：sigmoid 没有成对的 hexp2，只能逐分量调用；
-//    ReLU 有成对的取最大值，所以 f16x8_pack 的循环可以写成 i += 2。
+// 因为指数只出现在负半轴：
+//   - x 是很大的正数：走 x > 0 分支原样返回，不会产生新数值，也就不可能溢出；
+//   - x 是很大的负数：exp(x) 下溢成 0，结果是 alpha * (0 - 1) = -alpha，
+//     恰好就是数学极限值，也是正确结果；
+//   - 即使编译器把三元表达式编译成“两条分支都算、再按谓词选择”，
+//     正半轴上算出的 exp(大正数) = inf 也只会被丢掉，不会污染结果。
+//
+// NaN 语义（与 relu / gelu 对比时值得注意）：分支条件是 x > 0，
+// NaN 的比较结果为假，于是走进 exp(NaN) - 1，NaN 被正常传播到输出，
+// 与 PyTorch 的 elu 行为一致；而 relu 用的 fmax(NaN, 0) = 0
+// 会把 NaN 吞掉，gelu 的 fmax/fmin 夹取同理。
 // ----------------------------------------------------------------------------
-static inline sycl::half h_relu(sycl::half v) {
-  return sycl::fmax(sycl::half(0.0f), v);
+
+// ============================================================================
+// ELU 计算函数：为什么写成两个 static inline 辅助函数？
+// ============================================================================
+// ELU 的公式在 FP32 与 FP16 下写法不同：
+//   - static：只在本翻译单元可见，避免和别的模块的同名函数冲突；
+//   - inline：逐元素算子每个 work-item 都要调用一次，内联能省掉函数调用开销
+//     （对应 CUDA 的 __device__ __forceinline__）。
+//
+// FP32 版直接叫 elu、FP16 版叫 elu_half，与 CUDA 版及 swish 模块的
+// swish / swish_half 命名习惯一致。
+// ============================================================================
+// FP32
+// 三元选择：一条比较 + 两条分支 + 一次选择。
+// 注意 sycl::exp 传 float 时走 float 版本（对应 CUDA 的 expf）；
+// 参数顺序上先判 x > 0，正半轴直接返回 x，连 exp 都不需要参与最终结果。
+static inline float elu(float x) {
+  return x > 0.0f ? x : ALPHA * (sycl::exp(x) - 1.0f);
 }
 
-static inline half2_vec h_relu2(half2_vec v) {
-  // 常数 0 的 half2 形式：成对取最大值要求两个操作数同类型，
-  // 这里显式构造一次（两个 sycl::half(0.0f) 都是字面量，会被折叠）
-  const half2_vec z2 = half2_vec(sycl::half(0.0f), sycl::half(0.0f));
-  return sycl::fmax(v, z2);
+// FP16
+// half 没有隐式类型提升，比较 / 乘法 / 减法 / 指数都要走 half 路径：
+//   >      → 比较运算符（对应 CUDA 的 __hgt）
+//   *      → half 乘法（对应 __hmul）
+//   -      → half 减法（对应 __hsub）
+//   expf   → sycl::exp(sycl::half)（对应 hexp）
+// 常数 0、1 与 ALPHA 也用 sycl::half(...) 显式转成 half 再参与运算，
+// 字面量参数会被编译器直接折叠，不产生运行时开销。
+static inline sycl::half elu_half(sycl::half x) {
+  return x > sycl::half(0.0f)
+             ? x
+             : sycl::half(ALPHA) * (sycl::exp(x) - sycl::half(1.0f));
 }
-
-// ----------------------------------------------------------------------------
-// 为什么本文件没有 sigmoid 那样的 MAX_EXP_* 边界宏？
-//
-// sigmoid 要先算 exp(-x) 再取倒数，exp 的参数太大就会溢出成 inf，
-// 所以它必须先把 x 夹在 [MIN_EXP_F32, MAX_EXP_F32]（FP16 是 16 位版本）之内。
-//
-// ReLU 只需要一次取最大值：
-//   - x 是很大的正数：原样返回，不会产生新的数值，也就不会溢出；
-//   - x 是很大的负数：被截断成 0；
-//   - x 是 ±inf：得到 +inf / 0。
-// 结果一定落在 [0, +∞) 内，全程不需要夹取，因此不需要任何边界宏。
-//
-// 唯一需要留意的是 NaN 的处理，见 Kernel 1 内的说明。
-// ----------------------------------------------------------------------------
 
 // ============================================================================
 // Kernel 1：FP32 标量版（最朴素写法，作为正确性基准）
 // ============================================================================
 //
 // ---- 调用链：谁触发了这个 kernel？ ----
-// relu.py
-//   └─ lib.relu_f32(x, y)                        # Python 调用（pybind11）
-//       └─ relu_f32(torch::Tensor x, y)          # C++ host 包装函数（宏生成，
-//                                                #  运行在 CPU 上）
-//           └─ submit_relu_f32(queue, ...)       # 本函数
+// elu.py
+//   └─ lib.elu_f32(x, y)                        # Python 调用（pybind11）
+//       └─ elu_f32(torch::Tensor x, y)          # C++ host 包装函数（宏生成，
+//                                               #  运行在 CPU 上）
+//           └─ submit_elu_f32(queue, ...)       # 本函数
 //               └─ queue.submit(parallel_for)    # SYCL 提交（对应 CUDA 启动语法）
 //                   └─ Intel GPU 硬件并行执行 kernel lambda
 //
@@ -204,29 +231,23 @@ static inline half2_vec h_relu2(half2_vec v) {
 //   y : 输出数组
 //   N : 元素个数
 // ============================================================================
-static void submit_relu_f32(sycl::queue &queue, const float *x, float *y, int N,
-                            size_t global_range, size_t local_range) {
+static void submit_elu_f32(sycl::queue &queue, const float *x, float *y, int N,
+                           size_t global_range, size_t local_range) {
   queue.submit([&](sycl::handler &h) {
     // nd_range 分两层：global（总 work-item 数）与 local（每个 work-group 大小）
-    h.parallel_for<class ReluF32Kernel>(
+    h.parallel_for<class EluF32Kernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         // [=]：kernel lambda 只能按值捕获设备可访问的指针/标量
         [=](sycl::nd_item<1> item) {
-          // 全局 work-item 编号：get_global_id(0) 相当于 CUDA 的
+          // 全局 work-item 编号：相当于 CUDA 的
           // blockIdx.x * blockDim.x + threadIdx.x
           int idx = static_cast<int>(item.get_global_id(0));
           // 越界保护：N 不一定是启动 work-item 总数的整数倍，多余的不参与计算
           if (idx < N) {
-            // sycl::fmax 是 float 版本的取最大值函数，对应 CUDA 的 fmaxf
-            // （CUDA 里不能写成 fmax，那是 double 版本，会把参数提升成 double
-            // 再比较，明显更慢）。
-            // 参数顺序写成「0.0f 在前」只是习惯写法：除 NaN 外 fmax 是对称的。
-            // NaN 语义：IEEE 754-2008 的 maxNum 规定“一个参数是 NaN 时返回
-            // 另一个参数”，所以 fmax(NaN, 0.0f) == 0.0f，即本 kernel 会把
-            // NaN 输入清成 0；而 PyTorch 的 torch.relu 会把 NaN 传播到输出。
-            // 本模块基准测试的输入由 torch.randn 生成（有限值），不会触发该差异。
-            y[idx] = sycl::fmax(0.0f, x[idx]);
+            // 每个元素独立计算：正半轴返回 x，负半轴算 alpha*(exp(x)-1)。
+            // 结果与 PyTorch 的 elu（alpha=1）一致，NaN 也会被传播。
+            y[idx] = elu(x[idx]);
           }
         });
   });
@@ -238,46 +259,46 @@ static void submit_relu_f32(sycl::queue &queue, const float *x, float *y, int N,
 // 每个 work-item 连续处理 4 个元素，一次 16 字节的向量 load/store
 // 代替 4 次 4 字节访存，从而减少访存指令条数。
 //
-// 与 elementwise 的 f32x4 不同，ReLU 是单输入算子：只读 x 一份数据，
+// 与 elementwise 的 f32x4 不同，ELU 是单输入算子：只读 x 一份数据，
 // 没有 b 侧的第二路 load。
 //
-// ReLU 的计算只有 4 次取最大值，比 sigmoid 的 4 次 exp 轻得多，
-// 所以“省下的访存指令”更容易直接体现在耗时上；反过来，当规模大到已经
-// 吃满显存带宽时，向量化也就不会再有额外收益（见 README 的实测数据）。
+// “向量化”省的只是访存指令：计算仍要按 4 个分量逐条展开，每个分量都可能
+// 触发一次 exp，属于计算偏重的逐元素算子，因此向量化收益通常不如
+// elementwise 加法明显（实测 f32x4 与 f32 基本持平，见 README 的性能观察）。
 //
 // host 端对应启动：local = 256 / 4 = 64 个 work-item，每个 work-group
 // 仍处理 256 个元素。
 //
-// 已知缺陷（照搬 CUDA 版，本模块不修复）：只判断了 (idx + 0) < N，
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：只判断了 idx < N，
 // 没有像 elementwise 的 f32x4 那样用 (idx + 3) < N 判断整段 4 个元素是否齐全，
 // 也没有尾部（tail）逐元素回退分支。当 N 不是 4 的整数倍时，末尾 work-item
 // 会把 idx+1..idx+3 写到 y 的合法范围之外。
 // 本模块基准测试的 S/K 都是 256 的倍数，不会触发该问题。
 // ============================================================================
-static void submit_relu_f32x4(sycl::queue &queue, const float *x, float *y,
-                              int N, size_t global_range, size_t local_range) {
+static void submit_elu_f32x4(sycl::queue &queue, const float *x, float *y,
+                             int N, size_t global_range, size_t local_range) {
   queue.submit([&](sycl::handler &h) {
-    h.parallel_for<class ReluF32x4Kernel>(
+    h.parallel_for<class EluF32x4Kernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         [=](sycl::nd_item<1> item) {
           // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
           int idx = 4 * static_cast<int>(item.get_global_id(0));
-          // 读取写在越界判断内部（照搬 CUDA 版 relu_f32x4_kernel 的写法；
-          // sigmoid.sycl 的向量化版本把读取放在判断之外，两者在这一点上不同）
+          // 读取写在越界判断内部（照搬 CUDA 版 elu_f32x4_kernel 的写法；
+          // gelu 的向量化版本把读取放在判断之外，两者在这一点上不同）
           if (idx < N) {
             // 把 x[idx..idx+3] 的 16 字节 reinterpret 成 vec<float,4>，一次读入
             float4_vec reg_x = LOAD_FLOAT4(x + idx);
             // 结果也用 vec<float,4> 暂存，最后一次性写回
             float4_vec reg_y;
-            // 对 4 个分量分别取最大值（vec<float,4> 的分量下标是 0/1/2/3，
+            // 对 4 个分量分别算 ELU（vec<float,4> 的分量下标是 0/1/2/3，
             // 对应 CUDA float4 的 x/y/z/w）
-            reg_y[0] = sycl::fmax(0.0f, reg_x[0]);
-            reg_y[1] = sycl::fmax(0.0f, reg_x[1]);
-            reg_y[2] = sycl::fmax(0.0f, reg_x[2]);
-            reg_y[3] = sycl::fmax(0.0f, reg_x[3]);
+            reg_y[0] = elu(reg_x[0]);
+            reg_y[1] = elu(reg_x[1]);
+            reg_y[2] = elu(reg_x[2]);
+            reg_y[3] = elu(reg_x[3]);
             // 一次 16 字节写回 y[idx..idx+3]
-            // 注意：这里只覆盖了 (idx + 0) < N 的情况，缺尾部处理，见上面的说明
+            // 注意：这里只覆盖了 idx < N 的情况，缺尾部处理，见上面的说明
             STORE_FLOAT4(y + idx, reg_y);
           }
         });
@@ -291,20 +312,20 @@ static void submit_relu_f32x4(sycl::queue &queue, const float *x, float *y,
 // 相同显存带宽下，FP16 理论上能搬运两倍元素，代价是精度更低
 // （half 约 3~4 位十进制有效数字，保守按约 3 位）。
 //
-// 与 sigmoid 的 f16 版本相比，这里少了一处常量复用：
-// sigmoid 要预先算好 const half f = __float2half(1.0f)，是因为它留在例子里的
-// 常量 1 要在分子分母各出现一次；ReLU 只需要一个 0，而
-// sycl::half(0.0f) 的参数是字面量，编译器会直接折叠成 half 常量，
-// 不会产生运行时的类型转换开销。
+// ELU 用 FP16 计算时有两个必须注意的点：
+// 1. half 没有 float 那样的隐式类型提升，1.0 / 0.0 这类常数要用
+//    sycl::half(...) 显式转成 half，否则参与运算的类型不确定；
+// 2. 指数要用 half 版本的 sycl::exp，比较要用 half 的比较运算符
+//    （它们直接处理 16 位 half，不走 float），避免每次计算都插入类型转换。
 //
-// 取最大值要用 half 版本的 sycl::fmax（直接比较 16 位 half），写成 float
-// 版本会先把 half 提升到 float、算完再转回来，多出两条转换指令。
+// 负半轴 exp(x)-1 在 x 接近 0 时有相减抵消：exp(x) ≈ 1，两者相减后
+// 有效位数会明显减少（FP32 同样存在，只是 FP32 尾数多、影响小）。
 // ============================================================================
-static void submit_relu_f16(sycl::queue &queue, const sycl::half *x,
-                            sycl::half *y, int N, size_t global_range,
-                            size_t local_range) {
+static void submit_elu_f16(sycl::queue &queue, const sycl::half *x,
+                           sycl::half *y, int N, size_t global_range,
+                           size_t local_range) {
   queue.submit([&](sycl::handler &h) {
-    h.parallel_for<class ReluF16Kernel>(
+    h.parallel_for<class EluF16Kernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         [=](sycl::nd_item<1> item) {
@@ -312,9 +333,8 @@ static void submit_relu_f16(sycl::queue &queue, const sycl::half *x,
           int idx = static_cast<int>(item.get_global_id(0));
           // 越界保护：多余的 work-item 不参与计算
           if (idx < N) {
-            // h_relu 比较两个 half 标量并返回较大者，较大的那个写回 y
-            // （对应 CUDA 的 __hmax(__float2half(0.0f), x[idx])）
-            y[idx] = h_relu(x[idx]);
+            // 整个 ELU（比较 + 负半轴指数）都封装在 elu_half 里
+            y[idx] = elu_half(x[idx]);
           }
         });
   });
@@ -326,18 +346,18 @@ static void submit_relu_f16(sycl::queue &queue, const sycl::half *x,
 // vec<half,2> 是 2 元素 half 向量，一次 load/store 4 字节，
 // 每 work-item 一次处理 2 个连续元素。
 //
-// ReLU 其实有成对指令（CUDA 的 __hmax2 / SYCL 的 sycl::fmax 向量重载），
-// 但本 kernel 为了与 elementwise / sigmoid 的 f16x2 保持一致的“逐分量展开”
-// 写法，仍按 reg_y[0] / reg_y[1] 两行分别计算，成对指令的用法放在 Kernel 6。
+// 与 relu 的 f16x2 不同：ReLU 有成对指令 __hmax2（SYCL 里是 sycl::fmax 的
+// vec<half,2> 重载），可以把循环步长写成 2；ELU 没有 hexp2 这样的成对指数
+// 指令，只能逐分量调用 elu_half。
 //
-// 已知缺陷（照搬 CUDA 版，本模块不修复）：同 Kernel 2，只判断 (idx + 0) < N，
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：同 Kernel 2，只判断 idx < N，
 // 缺少尾部处理，当 N 不是 2 的整数倍时会把 y[idx + 1] 写到范围之外。
 // ============================================================================
-static void submit_relu_f16x2(sycl::queue &queue, const sycl::half *x,
-                              sycl::half *y, int N, size_t global_range,
-                              size_t local_range) {
+static void submit_elu_f16x2(sycl::queue &queue, const sycl::half *x,
+                             sycl::half *y, int N, size_t global_range,
+                             size_t local_range) {
   queue.submit([&](sycl::handler &h) {
-    h.parallel_for<class ReluF16x2Kernel>(
+    h.parallel_for<class EluF16x2Kernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         [=](sycl::nd_item<1> item) {
@@ -346,16 +366,14 @@ static void submit_relu_f16x2(sycl::queue &queue, const sycl::half *x,
           if (idx < N) {
             // 从 x[idx..idx+1] 读 4 字节为一个 vec<half,2>
             half2_vec reg_x = LOAD_HALF2(x + idx);
-            // 先读一次 y 只是为了拿到一个 vec<half,2> 类型的变量；
-            // 紧随其后的两行会把 reg_y 的两个分量全部覆盖，所以这次读取属于
-            // 冗余访存（照搬 CUDA 版，本次只补充注释）。
-            half2_vec reg_y = LOAD_HALF2(y + idx);
+            // 结果也用 vec<half,2> 暂存
+            half2_vec reg_y;
             // vec<half,2> 只有 0、1 两个分量（对应 CUDA half2 的 x、y），
-            // 分别取最大值
-            reg_y[0] = h_relu(reg_x[0]);
-            reg_y[1] = h_relu(reg_x[1]);
+            // 分别算 ELU；没有成对指令可用，只能逐分量调用
+            reg_y[0] = elu_half(reg_x[0]);
+            reg_y[1] = elu_half(reg_x[1]);
             // 一次写回 4 字节（2 个 half）
-            // 注意：同 Kernel 2，这里只覆盖了 (idx + 0) < N，缺尾部处理
+            // 注意：同 Kernel 2，这里只覆盖了 idx < N，缺尾部处理
             STORE_HALF2(y + idx, reg_y);
           }
         });
@@ -379,11 +397,11 @@ static void submit_relu_f16x2(sycl::queue &queue, const sycl::half *x,
 // 只保证段首不越界。当 N 落在 idx+7 时，(idx + 6) < N 依然成立，
 // 会把 y[idx + 7] 写到范围之外；尾部不足 8 个元素也没有回退分支。
 // ============================================================================
-static void submit_relu_f16x8(sycl::queue &queue, const sycl::half *x,
-                              sycl::half *y, int N, size_t global_range,
-                              size_t local_range) {
+static void submit_elu_f16x8(sycl::queue &queue, const sycl::half *x,
+                             sycl::half *y, int N, size_t global_range,
+                             size_t local_range) {
   queue.submit([&](sycl::handler &h) {
-    h.parallel_for<class ReluF16x8Kernel>(
+    h.parallel_for<class EluF16x8Kernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         [=](sycl::nd_item<1> item) {
@@ -397,15 +415,15 @@ static void submit_relu_f16x8(sycl::queue &queue, const sycl::half *x,
           half2_vec reg_x_3 = LOAD_HALF2(x + idx + 6);
           // 结果也用 4 个 half2 保存
           half2_vec reg_y_0, reg_y_1, reg_y_2, reg_y_3;
-          // 8 个分量分别取最大值（4 个 half2 × 2 个分量）
-          reg_y_0[0] = h_relu(reg_x_0[0]);
-          reg_y_0[1] = h_relu(reg_x_0[1]);
-          reg_y_1[0] = h_relu(reg_x_1[0]);
-          reg_y_1[1] = h_relu(reg_x_1[1]);
-          reg_y_2[0] = h_relu(reg_x_2[0]);
-          reg_y_2[1] = h_relu(reg_x_2[1]);
-          reg_y_3[0] = h_relu(reg_x_3[0]);
-          reg_y_3[1] = h_relu(reg_x_3[1]);
+          // 8 个分量分别算 ELU（4 个 half2 × 2 个分量）
+          reg_y_0[0] = elu_half(reg_x_0[0]);
+          reg_y_0[1] = elu_half(reg_x_0[1]);
+          reg_y_1[0] = elu_half(reg_x_1[0]);
+          reg_y_1[1] = elu_half(reg_x_1[1]);
+          reg_y_2[0] = elu_half(reg_x_2[0]);
+          reg_y_2[1] = elu_half(reg_x_2[1]);
+          reg_y_3[0] = elu_half(reg_x_3[0]);
+          reg_y_3[1] = elu_half(reg_x_3[1]);
           // 结果写回 y[idx .. idx+7]，逐段判断起始下标（只保证段首不越界）
           if ((idx + 0) < N) {
             STORE_HALF2(y + idx + 0, reg_y_0);
@@ -431,24 +449,22 @@ static void submit_relu_f16x8(sycl::queue &queue, const sycl::half *x,
 // 看作一个 16 字节向量，一次 load/store 128 位，比 Kernel 5 的多条 4 字节
 // 访存指令更少。
 //
-// 与 elementwise / sigmoid 的 f16x8_pack 一样，这里的 “pack” 指的是把连续
-// 8 个 half 整体当作 128 位向量搬运；计算部分仍是按 half 粒度处理。
+// 与 elementwise / sigmoid / relu 的 f16x8_pack 一样，这里的 “pack” 指的是
+// 把连续 8 个 half 整体当作 128 位向量搬运；计算部分仍是按 half 粒度处理。
 //
-// 计算部分的差异值得和 sigmoid 对照：
-//   sigmoid : 没有 hexp2，循环只能 for (int i = 0; i < 8; ++i) 逐个 half 算；
-//   relu    : 有 __hmax2（SYCL 里是 sycl::fmax 的 vec<half,2> 重载），
-//             循环写成 for (int i = 0; i < 8; i += 2)，
-//             一次处理一个 half2（2 个 half），8 个元素只需 4 次成对指令。
+// 计算部分的差异值得和 relu 对照：
+//   relu : 有 __hmax2，循环写成 for (int i = 0; i < 8; i += 2)，一次算 2 个；
+//   elu  : 没有成对的指数指令，循环写成 ++i，逐个 half 调用 elu_half。
 //
 // 已知缺陷（照搬 CUDA 版，本模块不修复）：这里只在 (idx + 7) < N 时写回，
 // 末尾不足 8 个元素的整段会被直接丢弃（漏算），但不会像 Kernel 2/4/5 那样
 // 越界写。本模块基准测试的 S/K 都是 256 的倍数，不会触发该问题。
 // ============================================================================
-static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
-                                   sycl::half *y, int N, size_t global_range,
-                                   size_t local_range) {
+static void submit_elu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
+                                  sycl::half *y, int N, size_t global_range,
+                                  size_t local_range) {
   queue.submit([&](sycl::handler &h) {
-    h.parallel_for<class ReluF16x8PackKernel>(
+    h.parallel_for<class EluF16x8PackKernel>(
         sycl::nd_range<1>(sycl::range<1>(global_range),
                           sycl::range<1>(local_range)),
         [=](sycl::nd_item<1> item) {
@@ -462,11 +478,9 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
           half8_vec pack_y;
 
 #pragma unroll
-          for (int i = 0; i < 8; i += 2) {
-            // __hmax2 / sycl::fmax(vec<half,2>) 一次处理 2 个 half：
-            // HALF2_AT(&pack_x[i]) 把 pack_x[i]、pack_x[i+1] 这两个 half
-            // 重解释成一个 vec<half,2>，成对取最大值后写回 pack_y[i]、pack_y[i+1]
-            HALF2_AT(&pack_y[i]) = h_relu2(HALF2_AT(&pack_x[i]));
+          for (int i = 0; i < 8; ++i) {
+            // 逐个 half 算 ELU（没有成对指令可用）
+            pack_y[i] = elu_half(pack_x[i]);
           }
           // 结果 pack_y[0..7] 共 128 位，一条 store 指令整体写回 y[idx..idx+7]
           if ((idx + 7) < N) {
@@ -478,8 +492,7 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
 
 // ----------------------------------------------------------------------------
 // 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
-// #str 会把参数按字面内容生成字符串，例如 STRINGFY(relu_f32) 得到
-// "relu_f32"。
+// #str 会把参数按字面内容生成字符串，例如 STRINGFY(elu_f32) 得到 "elu_f32"。
 // ----------------------------------------------------------------------------
 #define STRINGFY(str) #str
 #define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
@@ -488,11 +501,14 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
 // ----------------------------------------------------------------------------
 // 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype，
 // 否则打印张量信息并抛出运行时异常，避免把错误类型交给 kernel。
+//
+// 注意：CUDA 版 elu.cu 的报错文案是 "Tensor dtype must be ..."，
+// 与 relu.cu 的 "values must be ..." 略有不同；本文件沿用 CUDA 版文案。
 // ----------------------------------------------------------------------------
 #define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
   if (((T).options().dtype() != (th_type))) {                                  \
     std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
-    throw std::runtime_error("values must be " #th_type);                      \
+    throw std::runtime_error("Tensor dtype must be " #th_type);                \
   }
 
 // ============================================================================
@@ -504,35 +520,35 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
 //   element_type: kernel 中的 C++ 数据类型（float / sycl::half）
 //   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度）
 //
-// 展开后生成形如 relu_f32(torch::Tensor x, torch::Tensor y) 的函数：
+// 展开后生成形如 elu_f32(torch::Tensor x, torch::Tensor y) 的函数：
 //   1. 校验输入、输出张量的 dtype 与 XPU 设备，并检查两者形状一致；
 //   2. 根据张量形状计算 nd_range 的 global / local；
 //   3. 用 data_ptr() 拿裸指针并从当前 XPU stream 取 sycl::queue 提交 kernel。
 //
-// 启动策略（与 elementwise / sigmoid 一致）：
+// 启动策略（与前面几个模块一致）：
 // - 非二维张量：展平成 N，每个 work-group 固定处理 256 个元素，
 //   所以 local = 256 / n_elements，global = ceil(N / 256) * local；
 // - 二维 (S, K)：每行需要的 work-item 数不超过 1024 且能被向量宽度整除时，
 //   采用“一行一个 work-group”（local = K / n_elements，global = S * local）；
 //   否则回退到上面的展平策略。
 //
-// 与 CUDA 版的差异：CUDA 的 TORCH_BINDING_RELU 只判断了
+// 与 CUDA 版的差异：CUDA 的 TORCH_BINDING_ELU 只判断了
 // (K / n_elements) <= 1024，没有“大于 0”与“能被整除”两项检查；
-// 这里沿用 elementwise / sigmoid 模块的 3 项检查，行不可整除时回退到展平启动，
-// 避免 CUDA 版在 K 不能被向量宽度整除时静默漏算每行末尾几个元素。
+// 这里沿用 elementwise / relu / sigmoid 模块的 3 项检查，行不可整除时
+// 回退到展平启动，避免 CUDA 版在 K 不能被向量宽度整除时静默漏算每行末尾元素。
 //
 // 宏内注释统一使用 /* ... */ 块注释：宏定义每行以 \ 续行，用 // 会把该行末尾的
 // 续行符一起注释掉，导致宏定义断开；块注释在预处理阶段被替换为空格，不影响续行。
 // ============================================================================
-#define TORCH_BINDING_RELU(packed_type, th_type, element_type, n_elements)    \
-  void relu_##packed_type(torch::Tensor x, torch::Tensor y) {                 \
+#define TORCH_BINDING_ELU(packed_type, th_type, element_type, n_elements)     \
+  void elu_##packed_type(torch::Tensor x, torch::Tensor y) {                  \
     /* ① dtype 检查：输入输出都必须是 th_type */                              \
     CHECK_TORCH_TENSOR_DTYPE(x, (th_type))                                    \
     CHECK_TORCH_TENSOR_DTYPE(y, (th_type))                                    \
     /* ② 设备检查：kernel 只在 Intel GPU 上执行 */                            \
     TORCH_CHECK(x.device().is_xpu(), "x must be an XPU tensor");              \
     TORCH_CHECK(y.device().is_xpu(), "y must be an XPU tensor");              \
-    /* ③ 形状检查：relu 是逐元素算子，输入输出形状必须一致 */                 \
+    /* ③ 形状检查：elu 是逐元素算子，输入输出形状必须一致 */                  \
     TORCH_CHECK(x.sizes() == y.sizes(), "x/y must have the same shape");      \
     /* ④ ndim：二维 (S, K) 单独分支，其余按一维展平 */                        \
     const int ndim = x.dim();                                                 \
@@ -574,8 +590,8 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
         global_range = num_groups * local_range;                              \
       }                                                                       \
     }                                                                         \
-    submit_relu_##packed_type(queue, x_ptr, y_ptr, N, global_range,           \
-                              local_range);                                   \
+    submit_elu_##packed_type(queue, x_ptr, y_ptr, N, global_range,            \
+                             local_range);                                    \
   }
 
 // 实例化 6 个 host 启动函数，分别对应 6 个 kernel：
@@ -585,26 +601,26 @@ static void submit_relu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
 //   f16x2       : sycl::half，每 work-item 2 元素（half2）
 //   f16x8       : sycl::half，每 work-item 8 元素（4 次 half2，unpack）
 //   f16x8_pack  : sycl::half，每 work-item 8 元素（128 位打包访存）
-TORCH_BINDING_RELU(f32, torch::kFloat32, float, 1)
-TORCH_BINDING_RELU(f32x4, torch::kFloat32, float, 4)
-TORCH_BINDING_RELU(f16, torch::kHalf, sycl::half, 1)
-TORCH_BINDING_RELU(f16x2, torch::kHalf, sycl::half, 2)
-TORCH_BINDING_RELU(f16x8, torch::kHalf, sycl::half, 8)
-TORCH_BINDING_RELU(f16x8_pack, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_ELU(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_ELU(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_ELU(f16, torch::kHalf, sycl::half, 1)
+TORCH_BINDING_ELU(f16x2, torch::kHalf, sycl::half, 2)
+TORCH_BINDING_ELU(f16x8, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_ELU(f16x8_pack, torch::kHalf, sycl::half, 8)
 
 // ============================================================================
 // PyTorch C++ 扩展模块入口
 //
-// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 relu_lib）。
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 elu_lib）。
 // m.def 把上面生成的 6 个函数注册为 Python 模块里的同名函数，
-// 之后 Python 里就可以直接调用 lib.relu_f32(...) 等。
+// 之后 Python 里就可以直接调用 lib.elu_f32(...) 等。
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // 逐个把 C++ host 函数暴露给 Python
-  TORCH_BINDING_COMMON_EXTENSION(relu_f32)
-  TORCH_BINDING_COMMON_EXTENSION(relu_f32x4)
-  TORCH_BINDING_COMMON_EXTENSION(relu_f16)
-  TORCH_BINDING_COMMON_EXTENSION(relu_f16x2)
-  TORCH_BINDING_COMMON_EXTENSION(relu_f16x8)
-  TORCH_BINDING_COMMON_EXTENSION(relu_f16x8_pack)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f32)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f32x4)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f16)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f16x2)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f16x8)
+  TORCH_BINDING_COMMON_EXTENSION(elu_f16x8_pack)
 }

@@ -1,0 +1,680 @@
+// ============================================================================
+// gelu.sycl —— Intel oneAPI/SYCL GELU（Gaussian Error Linear Unit，
+//              高斯误差线性单元）教学示例
+//
+// 本文件实现 y[i] = gelu(x[i])，数组长度为 N。PyTorch 支持两种形式
+// （torch.nn.GELU 的 approximate 参数）：
+//
+//   精确式（approximate='none'）：
+//     gelu(x) = x * Φ(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+//   tanh 近似（approximate='tanh'）：
+//     gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// 其中 Φ(x) 是标准正态分布的累积分布函数（CDF）。
+// 本文件默认走 tanh 近似（GELU_OPS / HALF_GELU_OPS 宏指向
+// gelu_tanh_approximate），同时保留了 FP32 的精确式实现
+// gelu_none_approximate（用 sycl::erf），改一行宏定义就能切换。
+//
+// 所有 kernel 都把输入输出当作“一维数组”看待，二维 (S, K) 矩阵在启动端
+// 展平成 N = S * K。
+//
+// 对应 LeetCUDA/kernels/gelu/gelu.cu，包含 6 个计算版本：
+//   1. f32         : FP32 标量版（每 work-item 1 个元素）
+//   2. f32x4       : FP32 向量化版（每 work-item 4 个元素，16 字节访存）
+//   3. f16         : FP16 标量版（sycl::half，每 work-item 1 个元素）
+//   4. f16x2       : FP16 每 work-item 2 个元素（4 字节访存）
+//   5. f16x8       : FP16 每 work-item 8 个元素（4 次 4 字节访存，unpack 写法）
+//   6. f16x8_pack  : FP16 每 work-item 8 个元素（一次 16 字节/128 位访存）
+//
+// 与 elementwise / sigmoid / relu / elu 模块的关系：
+// 6 个版本一一对应，区别只是算子。下面重点说明 GELU 特有的三点：
+//   - 公式更长：一次 tanh（或 erf）外面还套着 x 的三次多项式，
+//     计算量比 sigmoid / elu 都大；
+//   - 必须做溢出保护：half 没有 tanh，这里用 sycl::exp 拼出 tanh，
+//     指数必然有溢出边界，因此需要 MAX_EXP_* / MIN_EXP_* 这组 clamp 宏；
+//   - FP16 精度陷阱最深：既踩到“相减抵消”的精度坑，
+//     也踩到“exp 溢出成 inf 后 inf/inf = NaN”的正确性坑
+//     （详见 docs/kernels/gelu/README.md 的“当前边界约束”一节）。
+//
+// 学习重点：
+// - 全局 work-item 编号 = item.get_global_id(0)
+// - 越界保护：if (idx < N)
+// - 先 clamp 再算：exp 系列函数的输入必须先夹到安全区间
+// - 宏（GELU_OPS / MAX_EXP_* / SQRT_2_PI）如何用来切换算法与精度档位
+//
+// 须知：本文件严格照搬 CUDA 版 gelu.cu 的算法与启动配置，**包括**
+// FP16 版本在 x ≳ 4.03 时输出 NaN（clamp 夹的是输入 x，而送进 exp 的是
+// 含 x³ 的 2*inner）、FP32 版本对大输入截断且吞掉 NaN，以及向量化版本
+// 缺少 tail 分支等已知缺陷；这些缺陷在本文件与 docs/kernels/gelu/README.md 中
+// 照实标注，本次不修复。
+//
+// 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
+// 供 gelu.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
+// ============================================================================
+
+// ============================================================================
+// 【GELU 曲线速览】一张小图看懂这个激活函数
+//
+//   y = x * Φ(x)（tanh 近似画法，x ∈ [-3, 3]）
+//
+//  4.0 ┤                          ***
+//      ┤                       ***
+//  3.0 ┤                    ***
+//      ┤                 ***
+//  2.0 ┤              ***
+//      ┤           ***
+//  1.0 ┤        ***
+//  0.0 ┤*******+                     ← 唯一的零点在 x = 0
+//      ┤    ***
+// -0.17┤   *                        ← 负向小凹陷，min ≈ -0.1700（x ≈ -0.752）
+//      └──────────────────────────────→ x
+//      -3   -2   -1   0   1   2   3
+//
+// 采样值(tanh 近似)：-3→-0.0036、-2→-0.0454、-1→-0.1588、-0.75→-0.1700、
+//                    0→0、1→0.8412、2→1.9546、3→2.9964
+//
+// 读图要点：
+// - 正半轴近似恒等映射：x 稍大（约 3 以上）后 Φ(x) ≈ 1，gelu(x) ≈ x；
+// - 负半轴不是硬零：x < 0 时输出是小负数，最小值约 -0.1700
+//   （出现在 x ≈ -0.752），所以 GELU 不是单调函数；
+// - 在 x = 0 处光滑可导（曲线整体无穷阶可导），既没有 ReLU 的
+//   “0 点不可导”，也没有 ELU 的“负半轴带一个转折”；
+// - 负半轴梯度不为 0：和 ELU 一样避免了死亡 ReLU 问题，
+//   但它的负值区间更浅（最深 -0.17，ELU 可以一路滑到 -1）；
+// - 计算量最大：一次 tanh（内部还要一次 exp）加若干次乘加，
+//   在 relu / elu / sigmoid / gelu / swish 这一族里属于计算偏重的算子。
+//
+// 与同族算子的对照（下文会反复引用这张表）：
+//   | 对比项     | relu            | elu (alpha=1)        | gelu (tanh 近似)      | swish / silu     |
+//   | 公式       | max(0, x)       | x>0 ? x : exp(x)-1   | 0.5x(1+tanh(k(...)))  | x/(1+exp(-x))    |
+//   | 值域       | [0, +∞)         | (-1, +∞)             | (-0.17, +∞)           | (-0.278, +∞)     |
+//   | 单调性     | 单调            | 单调                 | 非单调（负半轴凹陷）  | 非单调           |
+//   | x=0 处     | 不可导          | 可导，导数 1         | 光滑可导              | 光滑可导，导数0.5|
+//   | 每元素计算 | 一次取最大值    | 一次比较 + 一次 exp  | 多次乘加 + 一次 tanh  | exp + 加/除/乘   |
+//   | 溢出保护   | 不需要          | 不需要               | 需要 clamp            | 不需要           |
+// ============================================================================
+
+// 头文件列表与 elementwise / relu / sigmoid / elu 保持一致（其中若干头文件
+// 本模块没有直接使用，保留是为了方便几个模块对照阅读）。CUDA 版的
+// cuda_fp16.h / cuda_bf16.h / cuda_fp8.h 等在 SYCL 侧不需要，
+// half 类型与数学函数都由 <sycl/sycl.hpp> 提供。
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <torch/types.h>
+
+// 常量：与 CUDA 版保持同一套启动策略
+#define ELEMS_PER_GROUP 256
+#define MAX_GROUP_ITEMS 1024
+
+// ----------------------------------------------------------------------------
+// 向量类型别名（与前面几个模块一致）
+//   float4 -> sycl::vec<float, 4>（16 字节）
+//   half2  -> sycl::vec<sycl::half, 2>（4 字节）
+//   half8  -> sycl::vec<sycl::half, 8>（16 字节，一次 128 位访存）
+// ----------------------------------------------------------------------------
+using float4_vec = sycl::vec<float, 4>;
+using half2_vec = sycl::vec<sycl::half, 2>;
+using half8_vec = sycl::vec<sycl::half, 8>;
+
+// ----------------------------------------------------------------------------
+// 访存“重解释（reinterpret）”宏
+// 用法与前面几个模块一致：把连续内存 reinterpret 成更宽的 SYCL 向量类型，
+// 让编译器生成更宽的 load/store 指令。要求 ptr 按向量大小对齐。
+// ----------------------------------------------------------------------------
+#define LOAD_FLOAT4(ptr) (*reinterpret_cast<const float4_vec *>(ptr))
+#define STORE_FLOAT4(ptr, value) (*reinterpret_cast<float4_vec *>(ptr) = (value))
+
+#define LOAD_HALF2(ptr) (*reinterpret_cast<const half2_vec *>(ptr))
+#define STORE_HALF2(ptr, value) (*reinterpret_cast<half2_vec *>(ptr) = (value))
+
+#define LOAD_HALF8(ptr) (*reinterpret_cast<const half8_vec *>(ptr))
+#define STORE_HALF8(ptr, value) (*reinterpret_cast<half8_vec *>(ptr) = (value))
+
+// ----------------------------------------------------------------------------
+// exp 溢出保护边界（clamp 的上下限）
+//
+// GELU 的 tanh 是用 exp 拼出来的（half 没有 tanh）：
+//     tanh(t) = (exp(2t) - 1) / (exp(2t) + 1)
+// 只要 2t 超过 exp 的溢出阈值，exp(2t) 就变成 inf，分子分母同时变成 inf，
+// inf / inf = NaN。所以必须先把输入夹进安全区间，这与 sigmoid 的思路一致。
+//
+// F32：MAX_EXP_F32 = 88.3762626647949f，是逐元素 sigmoid 常用的保守上界，
+//      略小于 ln(FLT_MAX) ≈ 88.723；MIN_EXP_F32 与之对称取负。
+// F16：half 的取值范围比 float 窄得多——
+//      MAX_EXP_F16 = ln(65504) ≈ 11.09，65504 是 half 的最大规格数；
+//      MIN_EXP_F16 = ln(2^-14) ≈ -9.70，2^-14 是 half 的最小规格正数。
+//      两个边界不对称，是因为 half 能表示的正数范围本身就偏向 0 一侧。
+//
+// 【本文件最容易踩的坑】注意下面 kernel 里夹的是输入 x，
+// 而真正送进 exp 的是 2 * inner（inner 含 x 的三次项）：
+//     inner = sqrt(2/pi) * (x + 0.044715 * x^3) ≈ 0.797885 * (x + 0.044715x^3)
+// 反解 2 * inner = ln(65504) 得到 x ≈ 4.0278：也就是说 FP16 版本只要输入
+// 略大于 4.03，exp 就会溢出并算出 NaN（CUDA 版实测 x=4.0 正常、x=4.1 为 NaN；SYCL 版实测 x=4.0 正常、x=4.03 已为 NaN）。
+// 这是本模块已识别的问题：本次只补充注释、不改逻辑。
+// ----------------------------------------------------------------------------
+#define MAX_EXP_F32 88.3762626647949f
+#define MIN_EXP_F32 (-88.3762626647949f)
+#define MAX_EXP_F16 sycl::half(11.089866488461016f)
+#define MIN_EXP_F16 sycl::half(-9.704060527839234f)
+
+// ----------------------------------------------------------------------------
+// GELU 系数宏
+//
+// CUDA 版用 <math.h> 的扩展宏拼出系数：
+//   M_SQRT2    = sqrt(2)      ≈ 1.41421356
+//   M_2_SQRTPI = 2 / sqrt(pi) ≈ 1.12837917
+//   SQRT_2_PI  = M_SQRT2 * M_2_SQRTPI * 0.5f ≈ 0.7978845608 = sqrt(2/pi)
+// 也就是 tanh 近似公式里最前面那个系数。
+//
+// 不同标准库对 M_SQRT2 / M_2_SQRTPI / M_SQRT1_2 的定义情况不一致，
+// 为保证 SYCL 侧一定能编过，这里先补齐缺省定义（取值与 glibc 一致）。
+// 另外 CUDA 版的 SQRT_2_PI 宏没加括号（靠“乘法同优先级、从左到右”恰好算对），
+// 本文件补上了括号——一旦出现在优先级更高的表达式里，不带括号会静默出错。
+// ----------------------------------------------------------------------------
+#ifndef M_SQRT2
+#define M_SQRT2 1.41421356237309504880
+#endif
+#ifndef M_2_SQRTPI
+#define M_2_SQRTPI 1.12837916709551257390
+#endif
+#ifndef M_SQRT1_2
+#define M_SQRT1_2 0.70710678118654752440
+#endif
+
+// 注意：M_SQRT2 / M_2_SQRTPI 都是 double 类型常量，若直接写
+//   #define SQRT_2_PI (M_SQRT2 * M_2_SQRTPI * 0.5f)
+// 整个表达式就是 double，sycl::tanh 会解析到 double 重载，
+// 在 Intel GPU 上直接报 “Required aspect fp64 is not supported on the device”
+// （Arc A770 没有 fp64）。所以这里显式转成 float，保证全程 float 运算——
+// 这是 SYCL 侧与 CUDA 版的一个真实差异：CUDA 的 tanhf 会把 double 实参
+// 隐式转回 float，而 SYCL 的重载解析不会。
+#define SQRT_2_PI                                                                      \
+  (static_cast<float>(M_SQRT2) * static_cast<float>(M_2_SQRTPI) * 0.5f)
+#define HALF_1 sycl::half(1.0f)
+#define HALF_2 sycl::half(2.0f)
+#define HALF_DIV2 sycl::half(0.5f)
+// HALF_SQRT_2_PI：half 版的 sqrt(2/pi) 系数。
+// 与 CUDA 版一样，用“先由 FP32 字面量转出 half、再做 half 乘法”的方式构造，
+// 与 HALF_DIV2 配合得到 0.7979 附近的值。
+#define HALF_SQRT_2_PI                                                         \
+  (sycl::half(static_cast<float>(M_SQRT2)) *                                   \
+   sycl::half(static_cast<float>(M_2_SQRTPI)) * HALF_DIV2)
+// HALF_V_APP = 0.044715 是 tanh 近似公式里三次项的系数。
+#define HALF_V_APP sycl::half(0.044715f)
+
+// ----------------------------------------------------------------------------
+// 算法选择开关
+//
+//   HALF_GELU_OPS : FP16 走哪个函数（half 版本目前只有 tanh 近似一种）
+//   GELU_OPS      : FP32 走哪个函数，可切换为：
+//                   gelu_tanh_approximate（tanh 近似，默认）
+//                   gelu_none_approximate（用 erf 的精确式）
+//
+// 改这两行就能在“精度 / 速度”之间切换，不需要动任何 kernel 代码。
+// 注意 PyTorch 的 torch.nn.GELU 默认是 approximate='none'（erf 精确式），
+// 要让对照结果对齐，必须显式写 torch.nn.GELU("tanh")，gelu.py 就是这么做的。
+// ----------------------------------------------------------------------------
+#define HALF_GELU_OPS gelu_tanh_approximate
+#define GELU_OPS gelu_tanh_approximate
+
+// ============================================================================
+// GELU 计算函数：三个变体
+//
+//   gelu_tanh_approximate(sycl::half)  —— FP16，tanh 近似（用 exp 拼 tanh）
+//   gelu_tanh_approximate(float)       —— FP32，tanh 近似（直接调用 sycl::tanh）
+//   gelu_none_approximate(float)       —— FP32，精确式（用 sycl::erf）
+//
+// 三个函数都用 static inline 修饰（对应 CUDA 的 __inline__ __device__）：
+// 只在设备侧使用、且逐元素算子每个 work-item 都要调用一次，内联很关键。
+//
+// 之所以要分 FP16 / FP32 两个版本，是因为 half 没有隐式类型提升：
+// half 的乘法、加法、指数都要走 half 路径（运算符重载 / sycl::exp），
+// 常数也要用 sycl::half(...) 显式转换。
+// ============================================================================
+// half 没有 tanh，只能自己用指数拼：
+//   tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+// 这个拼法会引入误差（PyTorch 内部会把 half 提升到 float 再算 tanh）。
+static inline sycl::half gelu_tanh_approximate(sycl::half x) {
+  // 三次项 x^3：half 的乘法可以直接写 *
+  sycl::half x_cube = x * x * x;
+  // inner = 0.7978845608 * (x + 0.044715 * x * x * x)，是 tanh 的实参；
+  // 注意它含三次项，增长远比 x 快
+  sycl::half inner = HALF_SQRT_2_PI * (x + HALF_V_APP * x_cube);
+  // 用 (e^{2t} - 1) / (e^{2t} + 1) 拼出 tanh：
+  //   - inner 接近 0 时，exp(2*inner) ≈ 1，分子是两个接近的数相减，
+  //     有效位数大量丢失——这就是“half 版误差比 PyTorch 大”的根源；
+  //   - inner 偏大时，exp(2*inner) 溢出成 inf，分子分母都变成 inf，
+  //     inf / inf = NaN——这就是 FP16 版本在 x ≳ 4.03 时输出 NaN 的原因。
+  return HALF_DIV2 * x *
+         (HALF_1 + ((sycl::exp(inner * HALF_2) - HALF_1) /
+                    (sycl::exp(inner * HALF_2) + HALF_1)));
+}
+
+// FP32 版直接用 sycl::tanh，不存在上面的两个问题；
+// SQRT_2_PI * (x + 0.044715 * x^3) 就是 tanh 近似的实参。
+static inline float gelu_tanh_approximate(float x) {
+  return 0.5f * x *
+         (1.0f + sycl::tanh(SQRT_2_PI * (x + 0.044715f * x * x * x)));
+}
+
+// 精确式（approximate='none'）：0.5 * x * (1 + erf(x / sqrt(2)))，
+// 其中 M_SQRT1_2 = 1/sqrt(2) ≈ 0.7071。把 GELU_OPS 宏改成本函数即可切换。
+static inline float gelu_none_approximate(float x) {
+  return x * 0.5f *
+         (1.0f + sycl::erf(x * static_cast<float>(M_SQRT1_2)));
+}
+
+// ============================================================================
+// Kernel 1：FP32 标量版（最朴素写法，作为正确性基准）
+// ============================================================================
+//
+// ---- 调用链：谁触发了这个 kernel？ ----
+// gelu.py
+//   └─ lib.gelu_f32(x, y)                       # Python 调用（pybind11）
+//       └─ gelu_f32(torch::Tensor x, y)         # C++ host 包装函数（宏生成）
+//           └─ submit_gelu_f32(queue, ...)      # 本函数
+//               └─ queue.submit(parallel_for)   # SYCL 提交
+//                   └─ Intel GPU 硬件并行执行 kernel lambda
+//
+// 关键点：
+// - SYCL 在 host 端用 queue.submit + parallel_for 提交 kernel lambda，
+//   对应 CUDA 的 <<<grid, block>>> 启动；
+// - 全局编号靠 item.get_global_id(0)，对应 CUDA 的
+//   blockIdx.x * blockDim.x + threadIdx.x。
+//
+// 参数：
+//   x : 输入数组（设备端指针）
+//   y : 输出数组
+//   N : 元素个数
+// ============================================================================
+static void submit_gelu_f32(sycl::queue &queue, const float *x, float *y, int N,
+                            size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF32Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          int idx = static_cast<int>(item.get_global_id(0));
+          if (idx < N) {
+            // 先 clamp 再算：把 v 夹在 [MIN_EXP_F32, MAX_EXP_F32] 内，
+            // 保证后续 tanh 的实参不会落到无穷/NaN 的危险区。
+            // sycl::fmin / sycl::fmax 传 float 时走 float 版本（对应 CUDA 的
+            // fminf / fmaxf）。
+            // 注意 fmax(NaN, MIN_EXP_F32) = MIN_EXP_F32（IEEE maxNum 语义），
+            // 所以 NaN 输入会被“洗”成 -88.376 并最终输出 0，与 PyTorch 不一致；
+            // 同时 |x| > 88.376 的输入会被截断（gelu_f32(100) = 88.376），
+            // 本次只补充注释，kernel 逻辑保持原样。
+            float v = sycl::fmin(sycl::fmax(x[idx], MIN_EXP_F32), MAX_EXP_F32);
+            // GELU_OPS 默认展开为 gelu_tanh_approximate（FP32 tanh 近似）
+            y[idx] = GELU_OPS(v);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 2：FP32 向量化版（vec<float,4> = 4 个 float = 16 字节）
+// ============================================================================
+// 每个 work-item 连续处理 4 个元素，一次 16 字节的向量 load/store
+// 代替 4 次 4 字节访存，从而减少访存指令条数。
+//
+// 与 elementwise 的 f32x4 不同，GELU 是单输入算子：只读 x 一份数据。
+//
+// GELU 的算术强度高（一次 tanh 内部就含一次 exp），访存指令数不是瓶颈，
+// 所以向量化那点收益容易被“逐分量展开的冗长计算”吃掉——CUDA 侧实测
+// f32x4 甚至比标量版略慢。
+//
+// 与其它 kernel 的写法差异：这里没有在 load 之前做越界判断，
+// 而是先无条件读入 float4，最后只在写回时检查 (idx + 0) < N。
+//
+// host 端对应启动：local = 256 / 4 = 64 个 work-item。
+// ============================================================================
+static void submit_gelu_f32x4(sycl::queue &queue, const float *x, float *y,
+                              int N, size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF32x4Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
+          int idx = 4 * static_cast<int>(item.get_global_id(0));
+          // 无条件读入 16 字节：x[idx..idx+3]。
+          // 注意这里没有 idx < N 的保护，N 不是 4 的倍数时会越界读。
+          float4_vec reg_x = LOAD_FLOAT4(x + idx);
+          // 结果也用 vec<float,4> 暂存
+          float4_vec reg_y;
+
+          // 对 4 个分量分别 clamp，理由同标量版 Kernel 1
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            reg_x[i] = sycl::fmin(sycl::fmax(reg_x[i], MIN_EXP_F32), MAX_EXP_F32);
+          }
+          // 对 4 个分量分别算 GELU
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            reg_y[i] = GELU_OPS(reg_x[i]);
+          }
+          // 一次 16 字节写回 y[idx..idx+3]
+          //
+          // 已知缺陷（照搬 CUDA 版，本模块不修复）：这里只判断了 (idx + 0) < N，
+          // 没有用 (idx + 3) < N 判断整段 4 个元素是否齐全，也没有尾部回退分支。
+          // 当 N 不是 4 的整数倍时，读会越界 1~3 个 float，
+          // idx < N 仍成立时还会越界写 1~3 个 float。
+          // 基准测试的 S/K 都是 256 的倍数，不会触发该问题。
+          if ((idx + 0) < N) {
+            STORE_FLOAT4(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 3：FP16 标量版
+// ============================================================================
+// GELU 用 FP16 计算时有三个必须注意的点：
+// 1. half 没有隐式类型提升，常数要用 sycl::half(...) 显式转成 half；
+// 2. 绝对值保护要用 sycl::fmin / sycl::fmax 的 half 重载（对应 CUDA 的
+//    __hmin / __hmax，直接比较 16 位 half，不走 float）；
+// 3. 计算走 HALF_GELU_OPS，也就是用 sycl::exp 拼 tanh 的近似实现——
+//    它既有“相减抵消”的精度损失，也有“exp 溢出 → inf/inf = NaN”
+//    的正确性问题（输入 x ≳ 4.03 时触发）。
+// ============================================================================
+static void submit_gelu_f16(sycl::queue &queue, const sycl::half *x,
+                            sycl::half *y, int N, size_t global_range,
+                            size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF16Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          int idx = static_cast<int>(item.get_global_id(0));
+          if (idx < N) {
+            // 先取出输入，再做 half 版 clamp（上下界不对称）
+            sycl::half v = x[idx];
+            v = sycl::fmin(sycl::fmax(v, MIN_EXP_F16), MAX_EXP_F16);
+            // HALF_GELU_OPS 默认展开为 gelu_tanh_approximate(sycl::half)
+            y[idx] = HALF_GELU_OPS(v);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 4：FP16 每 work-item 2 个元素（vec<half,2> = 2 个 half = 4 字节）
+// ============================================================================
+// 与 relu 的 f16x2 不同：ReLU 有成对指令 __hmax2，可以把循环步长写成 2；
+// GELU 没有成对指令（没有 htanh2），只能逐分量计算。
+//
+// 写法上与其它模块的差异：这里没有先判断 idx < N 再 load，
+// 而是无条件读入 half2，最后只在写回时检查 (idx + 0) < N。
+// ============================================================================
+static void submit_gelu_f16x2(sycl::queue &queue, const sycl::half *x,
+                              sycl::half *y, int N, size_t global_range,
+                              size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF16x2Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 2 个连续 half
+          int idx = 2 * static_cast<int>(item.get_global_id(0));
+          // 无条件读入 4 字节：x[idx..idx+1]
+          half2_vec reg_x = LOAD_HALF2(x + idx);
+          half2_vec reg_y;
+          // 先对 2 个分量分别 clamp
+          reg_x[0] = sycl::fmin(sycl::fmax(reg_x[0], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x[1] = sycl::fmin(sycl::fmax(reg_x[1], MIN_EXP_F16), MAX_EXP_F16);
+          // 再对 2 个分量分别算 GELU
+          reg_y[0] = HALF_GELU_OPS(reg_x[0]);
+          reg_y[1] = HALF_GELU_OPS(reg_x[1]);
+          // 一次写回 4 字节（2 个 half）
+          // 已知缺陷：只判断 (idx + 0) < N，N 为奇数时会越界读 / 越界写 1 个 half
+          if ((idx + 0) < N) {
+            STORE_HALF2(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 5：FP16 每 work-item 8 个元素（用 4 次 vec<half,2> 操作完成，
+// unpack 写法）
+// ============================================================================
+// 每个 work-item 负责 8 个连续 half，把它们拆成 4 个 vec<half,2> 处理。
+//
+// 排版上的小细节（照搬 CUDA 版）：计算时把结果又写回了 reg_x_*（复用了输入
+// 寄存器），而不是像其它模块那样用单独的 reg_y_* 接收结果——本次只补充注释，
+// 不改逻辑；下面的 reg_y_* 声明保留，是为了与 CUDA 版逐行对应
+// （编译器很可能会把它们优化掉）。
+//
+// 注意 4 次 LOAD_HALF2 读取是无条件执行的，越界判断只出现在写回处。
+// ============================================================================
+static void submit_gelu_f16x8(sycl::queue &queue, const sycl::half *x,
+                              sycl::half *y, int N, size_t global_range,
+                              size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF16x8Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          // 一次读入 4 个 half2：覆盖 x[idx .. idx+7]
+          half2_vec reg_x_0 = LOAD_HALF2(x + idx + 0);
+          half2_vec reg_x_1 = LOAD_HALF2(x + idx + 2);
+          half2_vec reg_x_2 = LOAD_HALF2(x + idx + 4);
+          half2_vec reg_x_3 = LOAD_HALF2(x + idx + 6);
+          // 先对 8 个分量逐个 clamp
+          reg_x_0[0] = sycl::fmin(sycl::fmax(reg_x_0[0], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_0[1] = sycl::fmin(sycl::fmax(reg_x_0[1], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_1[0] = sycl::fmin(sycl::fmax(reg_x_1[0], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_1[1] = sycl::fmin(sycl::fmax(reg_x_1[1], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_2[0] = sycl::fmin(sycl::fmax(reg_x_2[0], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_2[1] = sycl::fmin(sycl::fmax(reg_x_2[1], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_3[0] = sycl::fmin(sycl::fmax(reg_x_3[0], MIN_EXP_F16), MAX_EXP_F16);
+          reg_x_3[1] = sycl::fmin(sycl::fmax(reg_x_3[1], MIN_EXP_F16), MAX_EXP_F16);
+          // 原本准备用于存放结果的 4 个 half2（本 kernel 实际把结果写回了 reg_x_*）
+          half2_vec reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+          // 再对 8 个分量逐个算 GELU（没有成对指令可用）
+          reg_x_0[0] = HALF_GELU_OPS(reg_x_0[0]);
+          reg_x_0[1] = HALF_GELU_OPS(reg_x_0[1]);
+          reg_x_1[0] = HALF_GELU_OPS(reg_x_1[0]);
+          reg_x_1[1] = HALF_GELU_OPS(reg_x_1[1]);
+          reg_x_2[0] = HALF_GELU_OPS(reg_x_2[0]);
+          reg_x_2[1] = HALF_GELU_OPS(reg_x_2[1]);
+          reg_x_3[0] = HALF_GELU_OPS(reg_x_3[0]);
+          reg_x_3[1] = HALF_GELU_OPS(reg_x_3[1]);
+          (void)reg_y_0;
+          (void)reg_y_1;
+          (void)reg_y_2;
+          (void)reg_y_3;
+          // 结果写回 y[idx .. idx+7]
+          // 已知缺陷：逐个 half2 判断起始下标，只保证段首不越界；
+          // N 落在 idx+7 时会把 y[idx + 7] 写到范围之外，尾部也没有回退分支。
+          if ((idx + 0) < N) {
+            STORE_HALF2(y + idx + 0, reg_x_0);
+          }
+          if ((idx + 2) < N) {
+            STORE_HALF2(y + idx + 2, reg_x_1);
+          }
+          if ((idx + 4) < N) {
+            STORE_HALF2(y + idx + 4, reg_x_2);
+          }
+          if ((idx + 6) < N) {
+            STORE_HALF2(y + idx + 6, reg_x_3);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 6：FP16 每 work-item 8 个元素（128 位打包版）
+// ============================================================================
+// 8 个 half 恰好是 16 字节 = 128 位，用 vec<half,8> 一次 load/store 完成搬运，
+// 比 Kernel 5 的多条 4 字节访存指令更少（CUDA 侧实测也是 FP16 里最快的）。
+//
+// 计算部分的差异值得和其它模块对照：
+//   relu : 有 __hmax2，循环写成 i += 2，一次处理一个 half2；
+//   gelu : 没有成对指令，循环写成 ++i，逐个 half 算 tanh 近似。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：这里只在 (idx + 7) < N 时写回，
+// 末尾不足 8 个元素的整段会被直接丢弃（漏算），但不会像 Kernel 2/4/5 那样
+// 越界写。
+// ============================================================================
+static void submit_gelu_f16x8_pack(sycl::queue &queue, const sycl::half *x,
+                                   sycl::half *y, int N, size_t global_range,
+                                   size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class GeluF16x8PackKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          // 把 x[idx..idx+7] 的 16 字节整体 reinterpret 成 vec<half,8>，
+          // 用一条访存指令读入 128 位（对应 CUDA 版可寻址的局部数组
+          // half pack_x[8] + LDST128BITS）
+          half8_vec pack_x = LOAD_HALF8(x + idx);
+          // 结果也用 vec<half,8>（16 字节）保存
+          half8_vec pack_y;
+
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            // 逐个 half：先 clamp 再算 GELU（没有成对指令可用）
+            sycl::half v =
+                sycl::fmin(sycl::fmax(pack_x[i], MIN_EXP_F16), MAX_EXP_F16);
+            pack_y[i] = HALF_GELU_OPS(v);
+          }
+          // 结果 pack_y[0..7] 共 128 位，一条 store 指令整体写回 y[idx..idx+7]
+          if ((idx + 7) < N) {
+            STORE_HALF8(y + idx, pack_y);
+          }
+        });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
+// ----------------------------------------------------------------------------
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+// ----------------------------------------------------------------------------
+// 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype。
+// CUDA 版 gelu.cu 的报错文案是 "values must be ..."。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
+  if (((T).options().dtype() != (th_type))) {                                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
+    throw std::runtime_error("values must be " #th_type);                      \
+  }
+
+// ============================================================================
+// host 启动函数生成宏
+//
+// 宏参数：
+//   packed_type : 命名后缀，如 f32 / f32x4 / f16x8_pack
+//   th_type     : 对应的 torch dtype（torch::kFloat32 / torch::kHalf）
+//   element_type: kernel 中的 C++ 数据类型（float / sycl::half）
+//   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度）
+//
+// 启动策略与前面几个模块一致：
+// - 非二维张量：展平启动，每个 work-group 处理 256 个元素；
+// - 二维 (S, K)：每行放得下且能被向量宽度整除时，一行一个 work-group；
+//   否则回退到展平启动。
+//
+// 与 CUDA 版的差异：CUDA 的 TORCH_BINDING_GELU 只判断了
+// (K / n_elements) <= 1024，这里沿用 elementwise / relu / sigmoid 的 3 项检查。
+//
+// 宏内注释统一使用 /* ... */ 块注释：宏定义每行以 \ 续行，用 // 会把该行末尾的
+// 续行符一起注释掉，导致宏定义断开。
+// ============================================================================
+#define TORCH_BINDING_GELU(packed_type, th_type, element_type, n_elements)    \
+  void gelu_##packed_type(torch::Tensor x, torch::Tensor y) {                 \
+    /* ① dtype 检查：输入输出都必须是 th_type */                              \
+    CHECK_TORCH_TENSOR_DTYPE(x, (th_type))                                    \
+    CHECK_TORCH_TENSOR_DTYPE(y, (th_type))                                    \
+    /* ② 设备检查：kernel 只在 Intel GPU 上执行 */                            \
+    TORCH_CHECK(x.device().is_xpu(), "x must be an XPU tensor");              \
+    TORCH_CHECK(y.device().is_xpu(), "y must be an XPU tensor");              \
+    /* ③ 形状检查：gelu 是逐元素算子，输入输出形状必须一致 */                 \
+    TORCH_CHECK(x.sizes() == y.sizes(), "x/y must have the same shape");      \
+    /* ④ ndim：二维 (S, K) 单独分支，其余按一维展平 */                        \
+    const int ndim = x.dim();                                                 \
+    /* ⑤ 取输入/输出裸指针（XPU 张量内存即 SYCL USM，可直接交给 kernel） */   \
+    const element_type *x_ptr =                                               \
+        reinterpret_cast<const element_type *>(x.data_ptr());                 \
+    element_type *y_ptr = reinterpret_cast<element_type *>(y.data_ptr());     \
+    /* ⑥ 从当前 XPU stream 取 sycl::queue，保证与 PyTorch 流一致 */           \
+    sycl::queue &queue = c10::xpu::getCurrentXPUStream().queue();             \
+    /* ⑦ 每个 work-item 一次处理的元素个数（向量宽度） */                     \
+    const size_t n_elem_per_item = (n_elements);                              \
+    /* ⑧ N：元素总数，二维时即 S * K */                                       \
+    int N = 1;                                                                \
+    for (int i = 0; i < ndim; ++i) {                                          \
+      N *= static_cast<int>(x.size(i));                                       \
+    }                                                                         \
+    size_t global_range = 0;                                                  \
+    size_t local_range = 0;                                                   \
+    if (ndim != 2) {                                                          \
+      /* 非二维张量：展平启动，每个 work-group 处理 256 个元素 */             \
+      local_range = ELEMS_PER_GROUP / n_elem_per_item;                        \
+      const size_t num_groups =                                               \
+          (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;   \
+      global_range = num_groups * local_range;                                \
+    } else {                                                                  \
+      const int S = static_cast<int>(x.size(0));                              \
+      const int K = static_cast<int>(x.size(1));                              \
+      const size_t items_per_row = K / n_elem_per_item;                       \
+      if (items_per_row > 0 && items_per_row <= MAX_GROUP_ITEMS &&            \
+          (K % n_elem_per_item) == 0) {                                       \
+        /* 二维且一行放得下：一行一个 work-group */                           \
+        local_range = items_per_row;                                          \
+        global_range = static_cast<size_t>(S) * local_range;                  \
+      } else {                                                                \
+        /* 行过长/不可整除：回退到展平启动 */                                 \
+        local_range = ELEMS_PER_GROUP / n_elem_per_item;                      \
+        const size_t num_groups =                                             \
+            (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP; \
+        global_range = num_groups * local_range;                              \
+      }                                                                       \
+    }                                                                         \
+    submit_gelu_##packed_type(queue, x_ptr, y_ptr, N, global_range,           \
+                              local_range);                                   \
+  }
+
+// 实例化 6 个 host 启动函数：
+//   f32         : float，每 work-item 1 元素
+//   f32x4       : float，每 work-item 4 元素（float4）
+//   f16         : sycl::half，每 work-item 1 元素
+//   f16x2       : sycl::half，每 work-item 2 元素（half2）
+//   f16x8       : sycl::half，每 work-item 8 元素（4 次 half2，unpack）
+//   f16x8_pack  : sycl::half，每 work-item 8 元素（128 位打包访存）
+TORCH_BINDING_GELU(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_GELU(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_GELU(f16, torch::kHalf, sycl::half, 1)
+TORCH_BINDING_GELU(f16x2, torch::kHalf, sycl::half, 2)
+TORCH_BINDING_GELU(f16x8, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_GELU(f16x8_pack, torch::kHalf, sycl::half, 8)
+
+// ============================================================================
+// PyTorch C++ 扩展模块入口
+//
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 gelu_lib）。
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f32)
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f32x4)
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f16)
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f16x2)
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f16x8)
+  TORCH_BINDING_COMMON_EXTENSION(gelu_f16x8_pack)
+}

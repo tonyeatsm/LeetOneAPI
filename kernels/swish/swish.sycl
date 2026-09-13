@@ -1,0 +1,552 @@
+// ============================================================================
+// swish.sycl —— Intel oneAPI/SYCL Swish / SiLU（自门控激活函数）教学示例
+//
+// 本文件实现 y[i] = swish(x[i])，数组长度为 N：
+//
+//   swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//
+// 命名说明：swish 与 silu 是同一个函数的两个名字。Google 在 2017 年的论文里
+// 把它叫 Swish（x * sigmoid(beta * x)，beta = 1 时即本文件的形式），
+// PyTorch 沿用了 SiLU 的叫法（torch.nn.SiLU / torch.nn.functional.silu）。
+// 本文件沿用仓库里已有的 swish 命名。
+//
+// 所有 kernel 都把输入输出当作“一维数组”看待，二维 (S, K) 矩阵在启动端
+// 展平成 N = S * K。
+//
+// 对应 LeetCUDA/kernels/swish/swish.cu，包含 6 个计算版本：
+//   1. f32         : FP32 标量版（每 work-item 1 个元素）
+//   2. f32x4       : FP32 向量化版（每 work-item 4 个元素，16 字节访存）
+//   3. f16         : FP16 标量版（sycl::half，每 work-item 1 个元素）
+//   4. f16x2       : FP16 每 work-item 2 个元素（4 字节访存）
+//   5. f16x8       : FP16 每 work-item 8 个元素（4 次 4 字节访存，unpack 写法）
+//   6. f16x8_pack  : FP16 每 work-item 8 个元素（一次 16 字节/128 位访存）
+//
+// 与 elementwise / sigmoid / relu / elu / gelu 模块的关系：
+// 6 个版本一一对应，区别只是算子。Swish 可以看作 sigmoid 模块的“进阶版”：
+// 同样是 exp，再多一步加法、除法和乘法。kernel 里没有真的先算 sigmoid 再乘，
+// 而是用等价的 x / (1 + exp(-x)) 一次算完，省掉一次中间变量。
+//
+// 下面重点说明 Swish 特有的三点：
+//   - 它把 sigmoid 用在了自己身上（x 乘上自己的门控），是 self-gated 家族
+//     （与 GELU 一起）的代表；
+//   - FP32 与 FP16 的**除序刻意不同**（见下面的辅助函数说明），
+//     数学等价但 half 侧的指令序列更短；
+//   - 不需要 clamp：exp(-x) 溢出成 inf 时结果恰好是数学极限 0，
+//     不会像 gelu 那样出现 inf/inf = NaN（详见下面的宏定义段）。
+//
+// 学习重点：
+// - 全局 work-item 编号 = item.get_global_id(0)
+// - 越界保护：if (idx < N)
+// - 溢出未必是坏事：分母上的 exp 溢出恰好对应 sigmoid(-∞) = 0
+// - 向量化 / 更宽访存 / FP16 都是逐元素算子的常见带宽优化手段
+//
+// 须知：本文件严格照搬 CUDA 版 swish.cu 的算法与启动配置，**包括**
+// FP16 在 x <= -11.09 时饱和成 -0.0、FP32 极小负数下溢成 -0.0，
+// 以及向量化版本缺少 tail 分支等已知缺陷；这些缺陷在本文件与
+// docs/kernels/swish/README.md 中照实标注，本次不修复。
+//
+// 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
+// 供 swish.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。
+// ============================================================================
+
+// ============================================================================
+// 【Swish 曲线速览】一张小图看懂这个激活函数
+//
+//   y = x / (1 + e^(-x)) = x * sigmoid(x)
+//
+//  3.0 ┤                          ***
+//      ┤                       ***
+//  2.0 ┤                    ***
+//      ┤                 ***
+//  1.0 ┤              ***
+//      ┤           ***
+//  0.0 ┤*******+
+//      ┤      ***
+// -0.28┤   *
+//      └──────────────────────────────→ x
+//      -3   -2   -1   0   1   2   3
+//
+// 采样值：-3→-0.1423、-2→-0.2384、-1.279→-0.2785、-1→-0.2689、
+//         0→0、1→0.7311、2→1.7616、3→2.8577、4→3.9281
+//
+// 读图要点：
+// - 正半轴近似恒等映射：x 稍大（约 3 以上）后 sigmoid(x) ≈ 1，
+//   swish(x) ≈ x，与 ReLU / ELU / GELU 的正半轴一致；
+// - 负半轴不是硬零：x < 0 时输出是小负数，x → -∞ 时趋近 0
+//   （因为 x * 0 里 sigmoid(x) 衰减得比 x 增长更快）；最小值约 -0.2785
+//   （出现在 x ≈ -1.279），所以 Swish 不是单调函数；
+// - 它是“自门控”的：sigmoid(x) 扮演门控，x 为正时门开（信号通过），
+//   x 为负时门关（信号被压制）——这就是 Swish 与 GELU 被称为
+//   self-gated / 平滑 ReLU 家族的原因；
+// - 在 x = 0 处光滑可导：swish'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))，
+//   在 x = 0 处等于 0.5（注意导数不为 0，这与 ReLU 的次梯度取 0 不同）；
+// - 与 GELU 的关系：两者形状很接近（先下凹再单调上升），GELU 可以看成
+//   “用正态 CDF 当门控”，Swish 用的是 sigmoid 门控；Swish 的凹陷更深
+//   （-0.2785 对 GELU 的 -0.1700），但计算更便宜（没有 tanh 里的三次多项式）。
+//
+// 与 sigmoid / relu 的对照（下文会反复引用这张表）：
+//   | 对比项     | relu              | gelu (tanh 近似)        | swish / silu            |
+//   | 公式       | max(0, x)         | 0.5x(1+tanh(...))       | x / (1 + exp(-x))       |
+//   | 值域       | [0, +∞)，仅负端   | (-0.17, +∞)             | (-0.2785, +∞)           |
+//   | 最小值位置 | x <= 0 全为 0     | x ≈ -0.752              | x ≈ -1.279              |
+//   | x=0 处     | 不可导（左0右1）  | 光滑可导                | 光滑可导，导数 0.5      |
+//   | 每元素计算 | 一次取最大值      | 多次乘加 + 一次 tanh    | 一次 exp + 加/除/乘     |
+//   | 溢出保护   | 不需要            | 需要 clamp              | 不需要（溢出对应极限值）|
+// ============================================================================
+
+// 头文件列表与 elementwise / relu / sigmoid / elu 保持一致（其中若干头文件
+// 本模块没有直接使用，保留是为了方便几个模块对照阅读）。CUDA 版的
+// cuda_fp16.h / cuda_runtime.h / float.h 等在 SYCL 侧不需要，
+// half 类型与数学函数都由 <sycl/sycl.hpp> 提供。
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <torch/types.h>
+
+// 常量：与 CUDA 版保持同一套启动策略
+#define ELEMS_PER_GROUP 256
+#define MAX_GROUP_ITEMS 1024
+
+// ----------------------------------------------------------------------------
+// 向量类型别名（与前面几个模块一致）
+//   float4 -> sycl::vec<float, 4>（16 字节）
+//   half2  -> sycl::vec<sycl::half, 2>（4 字节）
+//   half8  -> sycl::vec<sycl::half, 8>（16 字节，一次 128 位访存）
+// ----------------------------------------------------------------------------
+using float4_vec = sycl::vec<float, 4>;
+using half2_vec = sycl::vec<sycl::half, 2>;
+using half8_vec = sycl::vec<sycl::half, 8>;
+
+// ----------------------------------------------------------------------------
+// 访存“重解释（reinterpret）”宏
+// 用法与前面几个模块一致：把连续内存 reinterpret 成更宽的 SYCL 向量类型，
+// 让编译器生成更宽的 load/store 指令。要求 ptr 按向量大小对齐。
+// ----------------------------------------------------------------------------
+#define LOAD_FLOAT4(ptr) (*reinterpret_cast<const float4_vec *>(ptr))
+#define STORE_FLOAT4(ptr, value) (*reinterpret_cast<float4_vec *>(ptr) = (value))
+
+#define LOAD_HALF2(ptr) (*reinterpret_cast<const half2_vec *>(ptr))
+#define STORE_HALF2(ptr, value) (*reinterpret_cast<half2_vec *>(ptr) = (value))
+
+#define LOAD_HALF8(ptr) (*reinterpret_cast<const half8_vec *>(ptr))
+#define STORE_HALF8(ptr, value) (*reinterpret_cast<half8_vec *>(ptr) = (value))
+
+// ============================================================================
+// Swish 计算函数：为什么写成两个 static inline 辅助函数？
+//   static：只在本翻译单元可见；inline：逐元素算子每个 work-item 都要调用一次，
+//   内联能省掉函数调用开销（对应 CUDA 的 __device__ __forceinline__）。
+//
+// FP32 版直接叫 swish、FP16 版叫 swish_half，与 CUDA 版及 elu 模块的
+// elu / elu_half 命名习惯一致。
+//
+// ----------------------------------------------------------------------------
+// 为什么 Swish 不需要 sigmoid / gelu 那样的 clamp（溢出保护）？
+// ----------------------------------------------------------------------------
+// 本模块的公式里有除法 x / (1 + exp(-x))，但两个极端都对应正确的数学极限：
+//
+//   | 输入              | exp(-x)            | 结果          | 说明                |
+//   | x 很大的正数(88)   | exp(-88) ≈ 6e-39   | x / 1 = x     | sigmoid(88) ≈ 1     |
+//   | x 很大的负数(-88)  | exp(88) 溢出为 inf | x / inf = -0  | 数学极限就是 x*0    |
+//   | x = 0             | exp(0) = 1         | 0 / 2 = 0     | 恰好过原点          |
+//   | x = ±inf          | 0 / inf            | ±inf / NaN    | 与 PyTorch 行为一致 |
+//   | x = NaN           | NaN                | NaN           | NaN 正常传播        |
+//
+// 关键在第二行：exp(-x) 溢出得到的 inf 恰好对应 sigmoid(-∞) = 0，
+// 而 x / inf = 0 正是极限值，所以这里的溢出是“无害”的；
+// 不像 gelu 那样会算出 inf / inf = NaN。
+// 这是一个很好的对照：同样的 exp，放在分母上安全，
+// 放进 (exp(2t) - 1) / (exp(2t) + 1) 这种自己除自己的形式就不安全。
+// ----------------------------------------------------------------------------
+// FP32
+// 直接写成除法：x * (1 / (1 + exp(-x))) 与 x / (1 + exp(-x)) 等价，
+// 但后者只做一次除法、不需要额外的乘法与中间变量，寄存器压力更小。
+// sycl::exp 传 float 时走 float 版本（对应 CUDA 的 expf）。
+static inline float swish(float x) {
+  return x / (1.0f + sycl::exp(-x));
+}
+
+// FP16 辅助函数：half 没有隐式类型提升
+// 对应关系：/ → half 的 /、+ → +、* → *、-x → 一元 -、expf → sycl::exp。
+// 常数 1.0 用 sycl::half(1.0f) 显式转成 half（字面量参数会被编译器折叠）。
+//
+// 这里刻意写成 x * (1 / (1 + exp(-x)))——与 FP32 版的除序相反，
+// 但数学上等价（x / d == x * (1 / d)）。写成乘法是因为 half 的除法
+// 内部是一段较长的指令序列，反正都要算一次 1 / d，
+// 不如用乘法把结果乘回去。
+static inline sycl::half swish_half(sycl::half x) {
+  return x * (sycl::half(1.0f) / (sycl::half(1.0f) + sycl::exp(-x)));
+}
+
+// ============================================================================
+// Kernel 1：FP32 标量版（最朴素写法，作为正确性基准）
+// ============================================================================
+//
+// ---- 调用链：谁触发了这个 kernel？ ----
+// swish.py
+//   └─ lib.swish_f32(x, y)                      # Python 调用（pybind11）
+//       └─ swish_f32(torch::Tensor x, y)        # C++ host 包装函数（宏生成）
+//           └─ submit_swish_f32(queue, ...)     # 本函数
+//               └─ queue.submit(parallel_for)   # SYCL 提交
+//                   └─ Intel GPU 硬件并行执行 kernel lambda
+//
+// 参数：
+//   x : 输入数组（设备端指针）
+//   y : 输出数组
+//   N : 元素个数
+// ============================================================================
+static void submit_swish_f32(sycl::queue &queue, const float *x, float *y,
+                             int N, size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF32Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 全局 work-item 编号：对应 CUDA 的
+          // blockIdx.x * blockDim.x + threadIdx.x
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 越界保护：N 不一定是启动 work-item 总数的整数倍
+          if (idx < N) {
+            // 每个元素独立计算：x / (1 + exp(-x))，等价于 x * sigmoid(x)
+            y[idx] = swish(x[idx]);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 2：FP32 向量化版（vec<float,4> = 4 个 float = 16 字节）
+// ============================================================================
+// 每个 work-item 连续处理 4 个元素，一次 16 字节的向量 load/store
+// 代替 4 次 4 字节访存，从而减少访存指令条数。
+//
+// 与 elementwise 的 f32x4 不同，Swish 是单输入算子：只读 x 一份数据，
+// 没有 b 侧的第二路 load；与 sigmoid 的 f32x4 相比，这里少了“先 clamp”
+// 的四行，多了一次乘法（x * sigmoid(x)），指令数量相当。
+//
+// “向量化”省的只是访存指令：计算仍要按 4 个分量逐条展开，每个分量都要算
+// 一次 exp 和一次除法，属于计算偏重的逐元素算子，因此收益有限。
+//
+// host 端对应启动：local = 256 / 4 = 64 个 work-item。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：只判断了 idx < N，
+// 没有用 (idx + 3) < N 判断整段 4 个元素是否齐全，也没有尾部回退分支。
+// 当 N 不是 4 的整数倍时，末尾 work-item 会把 idx+1..idx+3 写到 y 范围之外。
+// ============================================================================
+static void submit_swish_f32x4(sycl::queue &queue, const float *x, float *y,
+                               int N, size_t global_range, size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF32x4Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 基础编号 t 对应“第 t 组 4 元素”的起点，真实下标是 4 * t
+          int idx = 4 * static_cast<int>(item.get_global_id(0));
+          // 读取写在越界判断内部（照搬 CUDA 版 swish_f32x4_kernel 的写法）
+          if (idx < N) {
+            // 一次读入 16 字节：x[idx..idx+3]
+            float4_vec reg_x = LOAD_FLOAT4(x + idx);
+            // 结果也用 vec<float,4> 暂存
+            float4_vec reg_y;
+            // 对 4 个分量分别算 Swish（对应 CUDA float4 的 x/y/z/w）
+            reg_y[0] = swish(reg_x[0]);
+            reg_y[1] = swish(reg_x[1]);
+            reg_y[2] = swish(reg_x[2]);
+            reg_y[3] = swish(reg_x[3]);
+            // 一次 16 字节写回 y[idx..idx+3]
+            // 注意：这里只覆盖了 idx < N，缺尾部处理，见上面的说明
+            STORE_FLOAT4(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 3：FP16 标量版
+// ============================================================================
+// half 是 IEEE 754 半精度浮点，只占 2 字节（float 的一半）。
+//
+// Swish 在 FP16 下有两处需要注意：
+// 1. 分母“吞掉小量”：当 exp(-x) < 2^-11（约 4.9e-4）时，1 + exp(-x)
+//    会因为 half 的加法舍入直接变成 1.0，于是 sigmoid(x) 被舍入成 1，
+//    swish(x) 退化成 x（例如 x = 11 时返回 11.0，与 PyTorch 一致）；
+// 2. 负方向饱和：x <= -11.09 时 exp(-x) 溢出成 inf，1 / inf = 0，
+//    结果是 x * 0 = -0.0；而 PyTorch（内部用 float 算 sigmoid）会给出
+//    -7.37e-05 这样的小值。绝对误差只有 7e-5，通常无感。
+// ============================================================================
+static void submit_swish_f16(sycl::queue &queue, const sycl::half *x,
+                             sycl::half *y, int N, size_t global_range,
+                             size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF16Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 与 Kernel 1 相同的全局编号方式：一个 work-item 一个元素
+          int idx = static_cast<int>(item.get_global_id(0));
+          // 越界保护：多余的 work-item 不参与计算
+          if (idx < N) {
+            // 整个 Swish（exp + 加法 + 除法 + 乘法）都封装在 swish_half 里
+            y[idx] = swish_half(x[idx]);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 4：FP16 每 work-item 2 个元素（vec<half,2> = 2 个 half = 4 字节）
+// ============================================================================
+// 与 relu 的 f16x2 不同：ReLU 有成对指令 __hmax2，可以把循环步长写成 2；
+// Swish 既没有 hexp2 也没有成对的除法，只能逐分量调用 swish_half。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：同 Kernel 2，只判断 idx < N，
+// N 不是 2 的整数倍时会把 y[idx + 1] 写到范围之外。
+// ============================================================================
+static void submit_swish_f16x2(sycl::queue &queue, const sycl::half *x,
+                               sycl::half *y, int N, size_t global_range,
+                               size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF16x2Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 2 个连续 half
+          int idx = 2 * static_cast<int>(item.get_global_id(0));
+          if (idx < N) {
+            // 从 x[idx..idx+1] 读 4 字节为一个 vec<half,2>
+            half2_vec reg_x = LOAD_HALF2(x + idx);
+            // 结果也用 vec<half,2> 暂存
+            half2_vec reg_y;
+            // vec<half,2> 只有 0、1 两个分量（对应 CUDA half2 的 x、y），
+            // 分别算 Swish；没有成对指令可用，只能逐分量调用
+            reg_y[0] = swish_half(reg_x[0]);
+            reg_y[1] = swish_half(reg_x[1]);
+            // 一次写回 4 字节（2 个 half）
+            // 注意：同 Kernel 2，这里只覆盖了 idx < N，缺尾部处理
+            STORE_HALF2(y + idx, reg_y);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 5：FP16 每 work-item 8 个元素（用 4 次 vec<half,2> 操作完成，
+// unpack 写法）
+// ============================================================================
+// 每个 work-item 负责 8 个连续 half，把它们拆成 4 个 vec<half,2> 处理。
+// 相比 f16x2，每个 work-item 做更多工作，能摊薄索引计算等固定开销。
+//
+// 这里的 “unpack” 指：数据在内存里本就是连续的 8 个 half，
+// 本 kernel 不把它整体打包搬运，而是按 half2 逐段读、逐段写。
+//
+// 注意 4 次 LOAD_HALF2 读取是无条件执行的，越界判断只出现在写回处。
+// ============================================================================
+static void submit_swish_f16x8(sycl::queue &queue, const sycl::half *x,
+                               sycl::half *y, int N, size_t global_range,
+                               size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF16x8Kernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          // 一次读入 4 个 half2：覆盖 x[idx .. idx+7]（读取在判断之外）
+          half2_vec reg_x_0 = LOAD_HALF2(x + idx + 0);
+          half2_vec reg_x_1 = LOAD_HALF2(x + idx + 2);
+          half2_vec reg_x_2 = LOAD_HALF2(x + idx + 4);
+          half2_vec reg_x_3 = LOAD_HALF2(x + idx + 6);
+          // 结果也用 4 个 half2 保存
+          half2_vec reg_y_0, reg_y_1, reg_y_2, reg_y_3;
+          // 8 个分量分别算 Swish（4 个 half2 × 2 个分量）
+          reg_y_0[0] = swish_half(reg_x_0[0]);
+          reg_y_0[1] = swish_half(reg_x_0[1]);
+          reg_y_1[0] = swish_half(reg_x_1[0]);
+          reg_y_1[1] = swish_half(reg_x_1[1]);
+          reg_y_2[0] = swish_half(reg_x_2[0]);
+          reg_y_2[1] = swish_half(reg_x_2[1]);
+          reg_y_3[0] = swish_half(reg_x_3[0]);
+          reg_y_3[1] = swish_half(reg_x_3[1]);
+          // 结果写回 y[idx .. idx+7]，逐段判断起始下标（只保证段首不越界）
+          if ((idx + 0) < N) {
+            STORE_HALF2(y + idx + 0, reg_y_0);
+          }
+          if ((idx + 2) < N) {
+            STORE_HALF2(y + idx + 2, reg_y_1);
+          }
+          if ((idx + 4) < N) {
+            STORE_HALF2(y + idx + 4, reg_y_2);
+          }
+          if ((idx + 6) < N) {
+            STORE_HALF2(y + idx + 6, reg_y_3);
+          }
+        });
+  });
+}
+
+// ============================================================================
+// Kernel 6：FP16 每 work-item 8 个元素（128 位打包版）
+// ============================================================================
+// 8 个 half 恰好是 16 字节 = 128 位，用 vec<half,8> 一次 load/store 完成搬运，
+// 比 Kernel 5 的多条 4 字节访存指令更少。
+//
+// 计算部分：Swish 没有成对指令（不像 ReLU 有 __hmax2），
+// 所以循环写成 ++i 逐个 half 调用 swish_half；这一点与 sigmoid 的
+// pack 版本写法相同。
+//
+// 已知缺陷（照搬 CUDA 版，本模块不修复）：这里只在 (idx + 7) < N 时写回，
+// 末尾不足 8 个元素的整段会被直接丢弃（漏算），但不会越界写。
+// ============================================================================
+static void submit_swish_f16x8_pack(sycl::queue &queue, const sycl::half *x,
+                                    sycl::half *y, int N, size_t global_range,
+                                    size_t local_range) {
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for<class SwishF16x8PackKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_range),
+                          sycl::range<1>(local_range)),
+        [=](sycl::nd_item<1> item) {
+          // 每 work-item 负责以 idx 为起点的 8 个连续 half
+          int idx = 8 * static_cast<int>(item.get_global_id(0));
+          // 把 x[idx..idx+7] 的 16 字节整体 reinterpret 成 vec<half,8>，
+          // 用一条访存指令读入 128 位（对应 CUDA 版可寻址的局部数组
+          // half pack_x[8] + LDST128BITS）
+          half8_vec pack_x = LOAD_HALF8(x + idx);
+          // 结果也用 vec<half,8>（16 字节）保存
+          half8_vec pack_y;
+
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            // 逐个 half 算 Swish（没有成对指令可用）
+            pack_y[i] = swish_half(pack_x[i]);
+          }
+          // 结果 pack_y[0..7] 共 128 位，一条 store 指令整体写回 y[idx..idx+7]
+          if ((idx + 7) < N) {
+            STORE_HALF8(y + idx, pack_y);
+          }
+        });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 字符串化宏：把函数名转成字符串，供 PYBIND11 注册 Python 函数时使用。
+// ----------------------------------------------------------------------------
+#define STRINGFY(str) #str
+#define TORCH_BINDING_COMMON_EXTENSION(func)                                   \
+  m.def(STRINGFY(func), &func, STRINGFY(func));
+
+// ----------------------------------------------------------------------------
+// 类型检查宏：确保传入的 torch::Tensor 是期望的 dtype。
+// CUDA 版 swish.cu 的报错文案是 "values must be ..."。
+// ----------------------------------------------------------------------------
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                                   \
+  if (((T).options().dtype() != (th_type))) {                                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl;                 \
+    throw std::runtime_error("values must be " #th_type);                      \
+  }
+
+// ============================================================================
+// host 启动函数生成宏
+//
+// 宏参数：
+//   packed_type : 命名后缀，如 f32 / f32x4 / f16x8_pack
+//   th_type     : 对应的 torch dtype（torch::kFloat32 / torch::kHalf）
+//   element_type: kernel 中的 C++ 数据类型（float / sycl::half）
+//   n_elements  : 每个 work-item 一次处理的元素个数（向量宽度）
+//
+// 启动策略与前面几个模块一致：
+// - 非二维张量：展平启动，每个 work-group 处理 256 个元素；
+// - 二维 (S, K)：每行放得下且能被向量宽度整除时，一行一个 work-group；
+//   否则回退到展平启动。
+//
+// 与 CUDA 版的差异：CUDA 的 TORCH_BINDING_SWISH 只判断了
+// (K / n_elements) <= 1024，这里沿用 elementwise / relu / sigmoid 的 3 项检查。
+//
+// 宏内注释统一使用 /* ... */ 块注释：宏定义每行以 \ 续行，用 // 会把该行末尾的
+// 续行符一起注释掉，导致宏定义断开。
+// ============================================================================
+#define TORCH_BINDING_SWISH(packed_type, th_type, element_type, n_elements)   \
+  void swish_##packed_type(torch::Tensor x, torch::Tensor y) {                \
+    /* ① dtype 检查：输入输出都必须是 th_type */                              \
+    CHECK_TORCH_TENSOR_DTYPE(x, (th_type))                                    \
+    CHECK_TORCH_TENSOR_DTYPE(y, (th_type))                                    \
+    /* ② 设备检查：kernel 只在 Intel GPU 上执行 */                            \
+    TORCH_CHECK(x.device().is_xpu(), "x must be an XPU tensor");              \
+    TORCH_CHECK(y.device().is_xpu(), "y must be an XPU tensor");              \
+    /* ③ 形状检查：swish 是逐元素算子，输入输出形状必须一致 */                \
+    TORCH_CHECK(x.sizes() == y.sizes(), "x/y must have the same shape");      \
+    /* ④ ndim：二维 (S, K) 单独分支，其余按一维展平 */                        \
+    const int ndim = x.dim();                                                 \
+    /* ⑤ 取输入/输出裸指针（XPU 张量内存即 SYCL USM，可直接交给 kernel） */   \
+    const element_type *x_ptr =                                               \
+        reinterpret_cast<const element_type *>(x.data_ptr());                 \
+    element_type *y_ptr = reinterpret_cast<element_type *>(y.data_ptr());     \
+    /* ⑥ 从当前 XPU stream 取 sycl::queue，保证与 PyTorch 流一致 */           \
+    sycl::queue &queue = c10::xpu::getCurrentXPUStream().queue();             \
+    /* ⑦ 每个 work-item 一次处理的元素个数（向量宽度） */                     \
+    const size_t n_elem_per_item = (n_elements);                              \
+    /* ⑧ N：元素总数，二维时即 S * K */                                       \
+    int N = 1;                                                                \
+    for (int i = 0; i < ndim; ++i) {                                          \
+      N *= static_cast<int>(x.size(i));                                       \
+    }                                                                         \
+    size_t global_range = 0;                                                  \
+    size_t local_range = 0;                                                   \
+    if (ndim != 2) {                                                          \
+      /* 非二维张量：展平启动，每个 work-group 处理 256 个元素 */             \
+      local_range = ELEMS_PER_GROUP / n_elem_per_item;                        \
+      const size_t num_groups =                                               \
+          (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP;   \
+      global_range = num_groups * local_range;                                \
+    } else {                                                                  \
+      const int S = static_cast<int>(x.size(0));                              \
+      const int K = static_cast<int>(x.size(1));                              \
+      const size_t items_per_row = K / n_elem_per_item;                       \
+      if (items_per_row > 0 && items_per_row <= MAX_GROUP_ITEMS &&            \
+          (K % n_elem_per_item) == 0) {                                       \
+        /* 二维且一行放得下：一行一个 work-group */                           \
+        local_range = items_per_row;                                          \
+        global_range = static_cast<size_t>(S) * local_range;                  \
+      } else {                                                                \
+        /* 行过长/不可整除：回退到展平启动 */                                 \
+        local_range = ELEMS_PER_GROUP / n_elem_per_item;                      \
+        const size_t num_groups =                                             \
+            (static_cast<size_t>(N) + ELEMS_PER_GROUP - 1) / ELEMS_PER_GROUP; \
+        global_range = num_groups * local_range;                              \
+      }                                                                       \
+    }                                                                         \
+    submit_swish_##packed_type(queue, x_ptr, y_ptr, N, global_range,          \
+                               local_range);                                  \
+  }
+
+// 实例化 6 个 host 启动函数：
+//   f32         : float，每 work-item 1 元素
+//   f32x4       : float，每 work-item 4 元素（float4）
+//   f16         : sycl::half，每 work-item 1 元素
+//   f16x2       : sycl::half，每 work-item 2 元素（half2）
+//   f16x8       : sycl::half，每 work-item 8 元素（4 次 half2，unpack）
+//   f16x8_pack  : sycl::half，每 work-item 8 元素（128 位打包访存）
+TORCH_BINDING_SWISH(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_SWISH(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_SWISH(f16, torch::kHalf, sycl::half, 1)
+TORCH_BINDING_SWISH(f16x2, torch::kHalf, sycl::half, 2)
+TORCH_BINDING_SWISH(f16x8, torch::kHalf, sycl::half, 8)
+TORCH_BINDING_SWISH(f16x8_pack, torch::kHalf, sycl::half, 8)
+
+// ============================================================================
+// PyTorch C++ 扩展模块入口
+//
+// TORCH_EXTENSION_NAME 由 PyTorch 在编译时注入（这里实际是 swish_lib）。
+// ============================================================================
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  TORCH_BINDING_COMMON_EXTENSION(swish_f32)
+  TORCH_BINDING_COMMON_EXTENSION(swish_f32x4)
+  TORCH_BINDING_COMMON_EXTENSION(swish_f16)
+  TORCH_BINDING_COMMON_EXTENSION(swish_f16x2)
+  TORCH_BINDING_COMMON_EXTENSION(swish_f16x8)
+  TORCH_BINDING_COMMON_EXTENSION(swish_f16x8_pack)
+}

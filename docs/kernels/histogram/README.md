@@ -56,7 +56,7 @@ SYCL 的等价移植，不改算法逻辑**，具体包括：
 | `kernels/histogram/histogram.py` | 用 `torch.utils.cpp_extension.load` 编译 `.sycl` 并执行简单测试 |
 | `kernels/histogram/README.md` | 模块使用说明与测试输出 |
 | `scripts/README.md` | oneAPI 容器与运行命令说明 |
-| `docs/histogram/README.md` | 本文件，模块设计说明 |
+| `docs/kernels/histogram/README.md` | 本文件，模块设计说明 |
 
 ## CUDA → SYCL 概念对照
 

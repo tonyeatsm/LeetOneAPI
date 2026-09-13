@@ -31,7 +31,7 @@
 // 须知：本文件严格照搬 CUDA 版 sigmoid.cu 的算法与启动配置，**包括**
 // f32x4 / f16x2 / f16x8 只判断段首下标、缺少 tail 分支（N 不是向量宽度整数倍
 // 时会越界写），以及 f16x8_pack 尾部不足 8 个元素整段漏算的已知缺陷；
-// 这些缺陷在本文件与 docs/sigmoid/README.md 中照实标注，本次不修复。
+// 这些缺陷在本文件与 docs/kernels/sigmoid/README.md 中照实标注，本次不修复。
 //
 // 文件后半部分是 PyTorch 绑定：把 SYCL kernel 包装成 Python 可调用的函数，
 // 供 sigmoid.py 编译与基准测试使用。运行环境要求 PyTorch XPU（Intel GPU 后端）。

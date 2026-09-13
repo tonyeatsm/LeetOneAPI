@@ -102,4 +102,16 @@ python3 sigmoid.py
 cd /workspace/LeetOneAPI/kernels/relu
 python3 relu.py
 
+# 激活函数 ELU
+cd /workspace/LeetOneAPI/kernels/elu
+python3 elu.py
+
+# 激活函数 GELU
+cd /workspace/LeetOneAPI/kernels/gelu
+python3 gelu.py
+
+# 激活函数 Swish (SiLU)
+cd /workspace/LeetOneAPI/kernels/swish
+python3 swish.py
+
 ```
